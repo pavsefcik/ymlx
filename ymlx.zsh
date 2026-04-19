@@ -16,7 +16,7 @@ ymlx() {
     return
   elif [[ "$selected" == "Download new model" ]]; then
     local script_dir="${${(%):-%x}:A:h}"
-    local curated_file="$script_dir/curated LLMs.txt"
+    local curated_file="$script_dir/curated_LLMs.md"
     typeset -A curated
     local entries=()
 
