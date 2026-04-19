@@ -12,16 +12,14 @@ A small zsh launcher for browsing, running, and downloading local MLX LLMs on Ap
 ## Requirements
 
 - Apple Silicon Mac (MLX is Apple Silicon only)
-- `zsh`
 - [`uv`](https://github.com/astral-sh/uv) — provides `uvx`, used to fetch `mlx-lm` on demand
 - [`gum`](https://github.com/charmbracelet/gum) — interactive menus
-- [`mlx-lm`](https://github.com/ml-explore/mlx-lm) — running chat/server uses `mlx_lm.chat` and `mlx_lm.server` directly, so install it on your PATH (e.g. `uv tool install mlx-lm` or `pipx install mlx-lm`). Downloads go through `uvx --from mlx-lm`, so that path works without a global install.
+- [`mlx-lm`](https://github.com/ml-explore/mlx-lm) — running chat/server uses `mlx_lm.chat` and `mlx_lm.server` directly.
 
 Install the CLI tools:
 
 ```sh
-brew install gum uv
-uv tool install mlx-lm
+brew install uv gum && uv tool install mlx-lm
 ```
 
 ## Install
@@ -36,7 +34,7 @@ Then run `ymlx` in any shell.
 
 ## Curated model list
 
-The "Download new model" submenu is populated from [`curated LLMs.txt`](curated%20LLMs.txt). Edit that file to add or remove entries.
+The "Download new model" submenu is populated from [`curated_LLMs.md`](curated_LLMs.md). Edit that file to add or remove entries.
 
 Format: blank-line-separated 4-line blocks.
 
