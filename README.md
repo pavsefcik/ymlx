@@ -34,15 +34,31 @@ Then run `ymlx` in any shell.
 
 ## Curated model list
 
-The "Download new model" submenu is populated from [`curated_LLMs.md`](curated_LLMs.md). Edit that file to add or remove entries.
+The "Download new model" submenu is populated from [`curated-llms.md`](curated-llms.md). Edit that file to add or remove entries.
 
-Format: blank-line-separated 4-line blocks.
+Format: blank-line-separated 2-line blocks under a tier header.
 
 ```
-Title
+if 8 GB RAM:
+
 mlx-community/Some-Model-ID
 tag1, tag2
-Short description (currently unused by the menu).
+
+mlx-community/Another-Model-ID
+tag1, tag2
+
+
+if 16 GB RAM:
+
+...
 ```
+
+Tier headers are any line matching `GB RAM` (e.g. `if 16 GB RAM:`). The menu adapts to the machine's RAM (read via `sysctl hw.memsize`):
+
+- ≤ 8 GB: only the 8 GB tier is shown
+- 16 / 18 GB: 16 GB tier shown, 8 GB tier dimmed
+- ≥ 24 GB: 24 GB tier shown, 16 GB tier dimmed, 8 GB hidden
+
+Models already present in `~/.cache/huggingface/hub` are filtered out of the list. The last entry is always a "Custom (paste HuggingFace ID)…" option for anything off-list.
 
 Tier headers are any line ending with `GB RAM:` (e.g. `If 16 GB RAM:`) and render as separators in the menu. The last menu item is always a manual "Custom (paste HuggingFace ID)…" entry, so you can still grab anything off HuggingFace directly.
