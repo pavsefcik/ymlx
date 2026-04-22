@@ -1,120 +1,252 @@
 #!/usr/bin/env zsh
 
 ymlx() {
+  local YMLX_DEBUG=false
   local hub_dir=~/.cache/huggingface/hub
-  local models=$(ls "$hub_dir" | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
+  local state_dir=~/.cache/ymlx
+  local state_file="$state_dir/servers.tsv"
+  local log_dir="$state_dir/logs"
+  mkdir -p "$state_dir" "$log_dir"
+  [[ -f "$state_file" ]] || : > "$state_file"
 
-  local selected=$(printf "%s\n──────────────────────\nOpen local LLM folder\nDownload new model\nExit" "$models" | gum choose --header $'\nSelect model:' --height 20)
-  [[ -z "$selected" ]] && return 1
+  _ymlx_prune() {
+    local tmp="$state_file.tmp" pid port model
+    : > "$tmp"
+    while IFS=$'\t' read -r pid port model; do
+      [[ -z "$pid" ]] && continue
+      if kill -0 "$pid" 2>/dev/null; then
+        printf '%s\t%s\t%s\n' "$pid" "$port" "$model" >> "$tmp"
+      fi
+    done < "$state_file"
+    mv "$tmp" "$state_file"
+  }
 
-  if [[ "$selected" == "──────────────────────" ]]; then
-    return
-  elif [[ "$selected" == "Exit" ]]; then
-    return
-  elif [[ "$selected" == "Open local LLM folder" ]]; then
-    open "$hub_dir"
-    return
-  elif [[ "$selected" == "Download new model" ]]; then
-    local script_dir="${${(%):-%x}:A:h}"
-    local curated_file="$script_dir/curated-llms.md"
+  _ymlx_drop() {
+    local target="$1" tmp="$state_file.tmp" pid port model
+    : > "$tmp"
+    while IFS=$'\t' read -r pid port model; do
+      [[ -z "$pid" || "$pid" == "$target" ]] && continue
+      printf '%s\t%s\t%s\n' "$pid" "$port" "$model" >> "$tmp"
+    done < "$state_file"
+    mv "$tmp" "$state_file"
+  }
 
-    local ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
-    local tier_active tier_dim
-    if (( ram_gb >= 24 )); then
-      tier_active=24; tier_dim=16
-    elif (( ram_gb >= 16 )); then
-      tier_active=16; tier_dim=8
-    else
-      tier_active=8; tier_dim=0
+  _ymlx_port_free() {
+    ! lsof -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
+  }
+
+  _ymlx_find_port() {
+    local p=11500
+    while (( p <= 11519 )) && ! _ymlx_port_free "$p"; do
+      (( p++ ))
+    done
+    echo "$p"
+  }
+
+  local models selected
+
+  while true; do
+    _ymlx_prune
+    models=$(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
+
+    local main_entries=() pid port model display_a has_active=0
+    typeset -A active_pid active_port active_model
+    while IFS=$'\t' read -r pid port model; do
+      display_a="● $model  :$port  (pid $pid)"
+      (( has_active == 0 )) && main_entries+=("─── Running ───")
+      has_active=1
+      main_entries+=("$display_a")
+      active_pid[$display_a]="$pid"
+      active_port[$display_a]="$port"
+      active_model[$display_a]="$model"
+    done < "$state_file"
+    if [[ -n "$models" ]]; then
+      main_entries+=("─── Installed ───")
+      main_entries+=(${(f)models})
     fi
+    main_entries+=("──────────────────────" "Open local LLM folder" "Download new model")
+    [[ "$YMLX_DEBUG" == true ]] && main_entries+=("Debug: ports 11500-11519")
+    main_entries+=("Stop all running models" "Exit // stops all running models")
 
-    typeset -A installed
-    local m
-    for m in ${(f)models}; do installed[$m]=1; done
+    selected=$(printf "%s\n" "${main_entries[@]}" | gum choose --header $'\nSelect model:' --height 30)
+    [[ -z "$selected" ]] && return 1
 
-    typeset -A curated
-    local entries=()
-    local dim_on=$'\e[2m' dim_off=$'\e[0m'
-    local source="" tags="" block_line=0 line current_tier=0 header num display
-
-    if [[ -r "$curated_file" ]]; then
-      while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ -z "$line" ]]; then
-          block_line=0
-          continue
-        fi
-        if [[ "$line" == *"GB RAM"* ]]; then
-          header="${line%:}"
-          num="${header//[^0-9]/}"
-          current_tier=$num
-          if (( num == tier_active )); then
-            entries+=("── ${header} ──")
-          elif (( num == tier_dim )); then
-            entries+=("${dim_on}── ${header} ──${dim_off}")
+    if [[ "$selected" == *───* ]]; then
+      continue
+    elif [[ "$selected" == "Stop all running models" ]]; then
+      local pid port model
+      while IFS=$'\t' read -r pid port model; do
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && echo "Stopped: $model (:$port)"
+      done < "$state_file"
+      : > "$state_file"
+      continue
+    elif [[ "$selected" == "Exit // stops all running models" ]]; then
+      local pid port model
+      while IFS=$'\t' read -r pid port model; do
+        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && echo "Stopped: $model (:$port)"
+      done < "$state_file"
+      : > "$state_file"
+      return
+    elif [[ -n "${active_pid[$selected]}" ]]; then
+      local a_pid="${active_pid[$selected]}"
+      local a_port="${active_port[$selected]}"
+      local a_model="${active_model[$selected]}"
+      local action=$(printf "Stop server\nCopy name\nStep back" | gum choose --header $'\n'"$a_model running on :$a_port (pid $a_pid)")
+      [[ -z "$action" ]] && continue
+      case "$action" in
+        "Stop server")
+          if kill "$a_pid" 2>/dev/null; then
+            echo "Stopped: $a_model on :$a_port (pid $a_pid)"
+          else
+            echo "Process $a_pid was already gone."
           fi
-          block_line=0
-          continue
-        fi
-        (( block_line++ ))
-        if (( block_line == 1 )); then
-          source="$line"
-        elif (( block_line == 2 )); then
-          tags="$line"
-          if [[ -z "${installed[$source]}" ]]; then
-            if (( current_tier == tier_active )); then
-              display="$source — $tags"
-              entries+=("$display")
-              curated[$display]="$source"
-            elif (( current_tier == tier_dim )); then
-              display="${dim_on}$source — $tags${dim_off}"
-              entries+=("$display")
-              curated[$display]="$source"
+          _ymlx_drop "$a_pid"
+          ;;
+        "Copy name")
+          echo "$a_model" | pbcopy
+          echo "Copied: $a_model"
+          ;;
+      esac
+      continue
+    elif [[ "$selected" == "Open local LLM folder" ]]; then
+      open "$hub_dir"
+      continue
+    elif [[ "$selected" == "Debug: ports 11500-11519" ]]; then
+      echo "lsof -i :11500-11519"
+      echo
+      lsof -iTCP:11500-11519 -sTCP:LISTEN -P -n 2>/dev/null || echo "(no listeners)"
+      echo
+      gum input --placeholder "(press enter to continue)" >/dev/null
+      continue
+    elif [[ "$selected" == "Download new model" ]]; then
+      local script_dir="${${(%):-%x}:A:h}"
+      local curated_file="$script_dir/curated-llms.md"
+
+      local ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+      local tier_active tier_dim
+      if (( ram_gb >= 24 )); then
+        tier_active=24; tier_dim=16
+      elif (( ram_gb >= 16 )); then
+        tier_active=16; tier_dim=8
+      else
+        tier_active=8; tier_dim=0
+      fi
+
+      typeset -A installed
+      local m
+      for m in ${(f)models}; do installed[$m]=1; done
+
+      typeset -A curated
+      local entries=() curated_count=0
+      local dim_on=$'\e[2m' dim_off=$'\e[0m'
+      local source="" tags="" block_line=0 line current_tier=0 header num display pending_header=""
+
+      if [[ -r "$curated_file" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          if [[ -z "$line" ]]; then
+            block_line=0
+            continue
+          fi
+          if [[ "$line" == *"GB RAM"* ]]; then
+            header="${line%:}"
+            num="${header//[^0-9]/}"
+            current_tier=$num
+            if (( num == tier_active )); then
+              pending_header="── ${header} ──"
+            elif (( num == tier_dim )); then
+              pending_header="${dim_on}── ${header} ──${dim_off}"
+            else
+              pending_header=""
+            fi
+            block_line=0
+            continue
+          fi
+          (( block_line++ ))
+          if (( block_line == 1 )); then
+            source="$line"
+          elif (( block_line == 2 )); then
+            tags="$line"
+            if [[ -z "${installed[$source]}" ]]; then
+              if (( current_tier == tier_active )); then
+                display="$source — $tags"
+              elif (( current_tier == tier_dim )); then
+                display="${dim_on}$source — $tags${dim_off}"
+              else
+                display=""
+              fi
+              if [[ -n "$display" ]]; then
+                if [[ -n "$pending_header" ]]; then
+                  entries+=("$pending_header")
+                  pending_header=""
+                fi
+                entries+=("$display")
+                curated[$display]="$source"
+                (( curated_count++ ))
+              fi
             fi
           fi
+        done < "$curated_file"
+      fi
+
+      if (( curated_count == 0 )); then
+        entries+=("No more hand picked models available")
+      fi
+      entries+=("──────────────" "Custom (paste HuggingFace ID)…" "Step back")
+
+      local pick=$(printf "%s\n" "${entries[@]}" | gum choose --header $'\nDownload new model:' --height 30)
+      [[ -z "$pick" ]] && continue
+
+      if [[ "$pick" == "Step back" || "$pick" == *──* || "$pick" == "No more hand picked models available" ]]; then
+        continue
+      fi
+
+      local model
+      if [[ "$pick" == "Custom (paste HuggingFace ID)…" ]]; then
+        model=$(gum input --placeholder "e.g. mlx-community/Ministral-3-3B-Instruct-2512-4bit" --prompt "Model: ")
+      else
+        local clean=$(print -r -- "$pick" | sed $'s/\x1b\\[[0-9;]*m//g')
+        model="${clean%% — *}"
+      fi
+      [[ -z "$model" ]] && continue
+      uvx --from mlx-lm python3 -c "from mlx_lm import load; load('$model')"
+      continue
+    fi
+
+    local action=$(printf "Run chat\nRun server\nCopy name\nRemove from folder\nStep back" | gum choose --header $'\n'"$selected:")
+    [[ -z "$action" ]] && continue
+
+    case "$action" in
+      "Run chat")
+        mlx_lm.chat --model "$selected" --max-tokens 2048 --temp 0.7 --top-p 0.9
+        ;;
+      "Run server")
+        local port=$(_ymlx_find_port)
+        local safe="${selected//\//_}"
+        local log="$log_dir/${safe}-${port}.log"
+        nohup mlx_lm.server --model "$selected" --port "$port" >"$log" 2>&1 &
+        local pid=$!
+        disown
+        printf '%s\t%s\t%s\n' "$pid" "$port" "$selected" >> "$state_file"
+        echo "Started: $selected on :$port (pid $pid)"
+        echo "Logs: $log"
+        ;;
+      "Copy name")
+        echo "$selected" | pbcopy
+        echo "Copied: $selected"
+        ;;
+      "Remove from folder")
+        local folder="$hub_dir/models--${selected//\//--}"
+        if [[ ! -d "$folder" ]]; then
+          echo "Folder not found: $folder"
+        elif gum confirm "Remove $selected from $hub_dir?"; then
+          rm -rf "$folder"
+          echo "Removed: $selected"
         fi
-      done < "$curated_file"
-    fi
-
-    entries+=("──────────────" "Custom (paste HuggingFace ID)…" "Step back")
-
-    local pick=$(printf "%s\n" "${entries[@]}" | gum choose --header $'\nDownload new model:' --height 20)
-    [[ -z "$pick" ]] && return 1
-
-    if [[ "$pick" == "Step back" || "$pick" == *──* ]]; then
-      ymlx
-      return
-    fi
-
-    local model
-    if [[ "$pick" == "Custom (paste HuggingFace ID)…" ]]; then
-      model=$(gum input --placeholder "e.g. mlx-community/Ministral-3-3B-Instruct-2512-4bit" --prompt "Model: ")
-    else
-      local clean=$(print -r -- "$pick" | sed $'s/\x1b\\[[0-9;]*m//g')
-      model="${clean%% — *}"
-    fi
-    [[ -z "$model" ]] && return 1
-    uvx --from mlx-lm python3 -c "from mlx_lm import load; load('$model')"
-    return
-  fi
-
-  local action=$(printf "Run chat\nRun server\nCopy name\nStep back" | gum choose --header $'\n'"$selected:")
-  [[ -z "$action" ]] && return 1
-
-  case "$action" in
-    "Run chat")
-      mlx_lm.chat --model "$selected" --max-tokens 2048 --temp 0.7 --top-p 0.9
-      ;;
-    "Run server")
-      mlx_lm.server --model "$selected"
-      ;;
-    "Copy name")
-      echo "$selected" | pbcopy
-      echo "Copied: $selected"
-      ;;
-    "Step back")
-      ymlx
-      ;;
-  esac
+        ;;
+      "Step back")
+        ;;
+    esac
+  done
 }
 
 ymlx "$@"
