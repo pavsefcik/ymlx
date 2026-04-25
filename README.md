@@ -4,9 +4,14 @@ A small zsh launcher for browsing, running, and downloading local MLX LLMs on Ap
 
 ## What it does
 
-- Lists models already cached under `~/.cache/huggingface/hub`
+- Lists installed models from `~/.cache/huggingface/hub` with per-model disk size and a running total
 - Runs chat or an OpenAI-compatible server against the selected model via `mlx-lm`
-- Downloads new models — either from a curated list or a pasted HuggingFace ID
+- Manages multiple concurrent servers — each gets a fresh port in 11500–11519
+- Shows running servers with their port, live RAM usage, and pid
+- Per-server actions: **Restart**, **Stop**, **Tail logs** (`q` to return), **Copy name**
+- Three-phase loading spinner (initialize → load weights → warm up); cancellable mid-load
+- Cleans up automatically — closing the terminal tab stops every server it started
+- Downloads new models — curated list filtered to your machine's RAM tier, or a pasted HuggingFace ID
 - Opens the local hub folder in Finder
 
 ## Requirements
@@ -60,5 +65,3 @@ Tier headers are any line matching `GB RAM` (e.g. `if 16 GB RAM:`). The menu ada
 - ≥ 24 GB: 24 GB tier shown, 16 GB tier dimmed, 8 GB hidden
 
 Models already present in `~/.cache/huggingface/hub` are filtered out of the list. The last entry is always a "Custom (paste HuggingFace ID)…" option for anything off-list.
-
-Tier headers are any line ending with `GB RAM:` (e.g. `If 16 GB RAM:`) and render as separators in the menu. The last menu item is always a manual "Custom (paste HuggingFace ID)…" entry, so you can still grab anything off HuggingFace directly.
