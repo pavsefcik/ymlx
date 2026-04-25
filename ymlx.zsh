@@ -31,15 +31,32 @@ ymlx() {
     mv "$tmp" "$state_file"
   }
 
+  _ymlx_stop_all() {
+    local pid port model
+    while IFS=$'\t' read -r pid port model; do
+      [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && echo "Stopped: $model (:$port)"
+    done < "$state_file"
+    : > "$state_file"
+    rm -f "$state_dir/last_port"
+  }
+
   _ymlx_port_free() {
     ! lsof -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
   }
 
   _ymlx_find_port() {
-    local p=11500
-    while (( p <= 11519 )) && ! _ymlx_port_free "$p"; do
-      (( p++ ))
+    local last_file="$state_dir/last_port"
+    local last=11499
+    [[ -r "$last_file" ]] && last=$(<"$last_file")
+    local p=$((last + 1))
+    (( p < 11500 || p > 11519 )) && p=11500
+    local start=$p tries=0
+    while ! _ymlx_port_free "$p"; do
+      (( p++, tries++ ))
+      (( p > 11519 )) && p=11500
+      (( tries >= 20 )) && { echo ""; return 1; }
     done
+    print -r -- "$p" > "$last_file"
     echo "$p"
   }
 
@@ -74,18 +91,10 @@ ymlx() {
     if [[ "$selected" == *───* ]]; then
       continue
     elif [[ "$selected" == "Stop all running models" ]]; then
-      local pid port model
-      while IFS=$'\t' read -r pid port model; do
-        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && echo "Stopped: $model (:$port)"
-      done < "$state_file"
-      : > "$state_file"
+      _ymlx_stop_all
       continue
     elif [[ "$selected" == "Exit // stops all running models" ]]; then
-      local pid port model
-      while IFS=$'\t' read -r pid port model; do
-        [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && echo "Stopped: $model (:$port)"
-      done < "$state_file"
-      : > "$state_file"
+      _ymlx_stop_all
       return
     elif [[ -n "${active_pid[$selected]}" ]]; then
       local a_pid="${active_pid[$selected]}"
@@ -221,14 +230,55 @@ ymlx() {
         ;;
       "Run server")
         local port=$(_ymlx_find_port)
+        if [[ -z "$port" ]]; then
+          echo "No free port in 11500-11519."
+          continue
+        fi
         local safe="${selected//\//_}"
         local log="$log_dir/${safe}-${port}.log"
-        nohup mlx_lm.server --model "$selected" --port "$port" >"$log" 2>&1 &
+        mlx_lm.server --model "$selected" --port "$port" >"$log" 2>&1 &
         local pid=$!
-        disown
         printf '%s\t%s\t%s\n' "$pid" "$port" "$selected" >> "$state_file"
-        echo "Started: $selected on :$port (pid $pid)"
-        echo "Logs: $log"
+        local rc=0
+        gum spin --spinner dot --title "Initializing $selected… (Ctrl-C to cancel)" -- zsh -c "
+          while kill -0 $pid 2>/dev/null; do
+            [[ -s '$log' ]] && exit 0
+            sleep 0.3
+          done
+          exit 1
+        " && \
+        gum spin --spinner dot --title "Loading model weights…" -- zsh -c "
+          while kill -0 $pid 2>/dev/null; do
+            curl -fs -o /dev/null --max-time 1 http://127.0.0.1:$port/v1/models && exit 0
+            grep -qE 'Starting|Uvicorn|running|listening|Application startup' '$log' 2>/dev/null && exit 0
+            sleep 0.5
+          done
+          exit 1
+        " && \
+        gum spin --spinner dot --title "Warming up server on :$port…" -- zsh -c "
+          while kill -0 $pid 2>/dev/null; do
+            curl -fs -o /dev/null --max-time 1 http://127.0.0.1:$port/v1/models && exit 0
+            sleep 0.5
+          done
+          exit 1
+        "
+        rc=$?
+        if (( rc == 0 )); then
+          echo "Started: $selected on :$port (pid $pid)"
+          echo "Logs: $log"
+        elif kill -0 "$pid" 2>/dev/null; then
+          if gum confirm "Loading cancelled. Kill $selected (pid $pid)?"; then
+            kill "$pid" 2>/dev/null
+            _ymlx_drop "$pid"
+            echo "Killed: $selected"
+          else
+            echo "Still loading in background on :$port (pid $pid). Logs: $log"
+          fi
+        else
+          _ymlx_drop "$pid"
+          echo "Failed to start $selected. Last log lines:"
+          tail -n 20 "$log"
+        fi
         ;;
       "Copy name")
         echo "$selected" | pbcopy
@@ -248,5 +298,17 @@ ymlx() {
     esac
   done
 }
+
+_ymlx_cleanup() {
+  local sf=~/.cache/ymlx/servers.tsv
+  [[ -f $sf ]] || return
+  local pid port model
+  while IFS=$'\t' read -r pid port model; do
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
+  done < "$sf"
+  : > "$sf"
+  rm -f ~/.cache/ymlx/last_port
+}
+trap _ymlx_cleanup EXIT INT TERM HUP
 
 ymlx "$@"
