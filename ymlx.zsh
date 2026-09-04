@@ -16,6 +16,7 @@ ymlx() {
   local log_dir="$state_dir/logs"
   local config_file="$state_dir/config.zsh"
   local last_model_file="$state_dir/last.txt"
+  local chat_dir="$state_dir/chats"
 
   typeset -ga YMLX_CHAT_FLAGS=( --max-tokens 2048 --temp 0.7 --top-p 0.9 )
   typeset -ga YMLX_SERVER_FLAGS=()
@@ -32,7 +33,16 @@ ymlx() {
     return 1
   fi
 
-  mkdir -p "$state_dir" "$log_dir"
+  mkdir -p "$state_dir" "$log_dir" "$chat_dir"
+
+  # The curated download list lives in the standalone ymlx-curator repo; pull
+  # the latest copy at startup and cache it. If the fetch fails (offline),
+  # fall back to the last cached copy.
+  local curated_url="https://raw.githubusercontent.com/pavsefcik/ymlx-curator/main/ymlx-curator.md"
+  local curated_file="$state_dir/curated-llms.md"
+  if ! curl -fsSL --connect-timeout 3 --max-time 5 "$curated_url" -o "$curated_file" 2>/dev/null; then
+    [[ -f "$curated_file" ]] || : > "$curated_file"
+  fi
 
   _ymlx_write_default_config() {
     cat > "$1" <<'CFG'
@@ -42,7 +52,7 @@ ymlx() {
 # block to add advanced flags — see `mlx_lm.chat --help` / `mlx_lm.server --help`.
 # --model / --port / --host are managed by ymlx (port auto-discovery 11500-11519).
 
-# >>> ymlx-managed quick settings — edit via "Settings" menu, not by hand <<<
+# >>> ymlx-managed quick settings — edit via "Settings" (expert mode via Advanced settings) <<<
 YMLX_QUICK_THINKING="default"      # default | on | off  (default = use model's built-in)
 YMLX_QUICK_TEMP=""                 # e.g. 0.7, or empty to use YMLX_CHAT_FLAGS default
 YMLX_QUICK_MAX_TOKENS=""           # e.g. 2048, or empty to use YMLX_CHAT_FLAGS default
@@ -96,6 +106,23 @@ CFG
   typeset -g YMLX_QUICK_SYSTEM_PROMPT=""
   typeset -g YMLX_QUICK_EXPERT="off"
   typeset -g _YMLX_TMP_CFG=""
+  typeset -g _YMLX_STTY_SAVED=""
+  typeset -g _YMLX_MENU_QUIT=0
+  typeset -g _YMLX_MENU_EXPERT=0
+  typeset -g _YMLX_MENU_KEY=""
+  typeset -ga _YMLX_MENU_LINES=()
+  typeset -ga _YMLX_MENU_KINDS=()
+  typeset -ga _YMLX_MENU_MODELS=()
+  typeset -ga _YMLX_MENU_PORTS=()
+  typeset -ga _YMLX_MENU_ACTIONS=()
+  typeset -gi _YMLX_MENU_CURSOR=0
+  typeset -gi _YMLX_MENU_SCROLL=0
+  typeset -gi _YMLX_MENU_VIS=10
+  typeset -gi _YMLX_MENU_WIDTH=80
+  typeset -gi _YMLX_MENU_DRAWN=0
+  typeset -gi _YMLX_MENU_NLINES=0
+  typeset -gi _YMLX_MENU_NO_MODELS=0
+  _YMLX_STTY_SAVED="$(stty -g 2>/dev/null)"
 
   _ymlx_talk_info() {
     local m="$1" p="$2"
@@ -116,27 +143,41 @@ CFG
   _ymlx_chat_repl() {
     local model="$1" port="$2"
     if ! command -v python3 >/dev/null 2>&1; then
-      gum style --foreground 196 "python3 not found — install Xcode Command Line Tools (xcode-select --install) to use 'Talk to it'."
+      gum style --foreground 196 "python3 not found — install Xcode Command Line Tools (xcode-select --install) to use the built-in chat."
       gum input --placeholder "(press enter to continue)" >/dev/null
       return 1
     fi
+    local friendly=$(_ymlx_display_name "$model")
     local url="http://127.0.0.1:$port/v1/chat/completions"
     local sysp="$YMLX_QUICK_SYSTEM_PROMPT"
+    local thinking="${YMLX_QUICK_THINKING:-default}"
+    local stamp=$(date +%Y-%m-%d_%H%M%S)
+    local safe="${model//\//_}"
+    local chat_log="$chat_dir/${stamp}_${safe}.txt"
+    {
+      echo "# Chat with $friendly on :$port"
+      echo "# Model: $model"
+      echo "# Base URL: http://localhost:$port/v1"
+      echo "# Started: $(date '+%Y-%m-%d %H:%M:%S')"
+      echo "# Thinking: $thinking"
+      echo
+    } > "$chat_log"
     echo
-    gum style --foreground 212 --bold "Chatting with $model on :$port"
-    echo "  Commands: /reset clears history · /exit or Ctrl-D to leave"
-    [[ -n "$sysp" ]] && echo "  System prompt: ${sysp:0:80}$([[ ${#sysp} -gt 80 ]] && echo '…')"
-    case "$YMLX_QUICK_THINKING" in
-      off)     echo "  Thinking: off (hiding <think>/[THINK] blocks from output)" ;;
-      on)      echo "  Thinking: on" ;;
-      *)       echo "  Thinking: default (model decides — change in Settings to force off)" ;;
-    esac
+    gum style --foreground 212 --bold "Chatting with $friendly on :$port"
+    echo "  Base URL:   http://localhost:$port/v1"
+    echo "  Model:      $model"
+    echo "  Commands:   /reset clears history • /exit or Ctrl-D to leave"
+    echo "  Thinking:   $thinking • tab toggle thinking"
     echo
     python3 -c "$(cat <<'PY'
-import sys, json, re, urllib.request, urllib.error
+import sys, json, re, signal, urllib.request, urllib.error
+
 url, model = sys.argv[1], sys.argv[2]
 sysp = sys.argv[3] if len(sys.argv) > 3 else ""
-strip_think = (sys.argv[4] == "off") if len(sys.argv) > 4 else False
+thinking = sys.argv[4] if len(sys.argv) > 4 else "default"
+log_path = sys.argv[5] if len(sys.argv) > 5 else ""
+
+strip_think = (thinking == "off")
 base = ([{"role":"system","content":sysp}] if sysp else [])
 messages = list(base)
 
@@ -183,46 +224,80 @@ class Filter:
         rest, self.buf = self.buf, ""
         return rest
 
+flt = Filter(strip_think)
+PROMPT = "\033[1;36myou>\033[0m "
+
+def log(msg):
+    if log_path:
+        try:
+            with open(log_path, "a") as f:
+                f.write(msg + "\n")
+        except OSError:
+            pass
+
+def toggle_thinking(signum, frame):
+    global strip_think, thinking
+    strip_think = not strip_think
+    flt.on = strip_think
+    thinking = "off" if strip_think else "on"
+    sys.stdout.write("\r\033[2m(thinking %s)\033[0m\r\n" % thinking)
+    sys.stdout.flush()
+
+try:
+    signal.signal(signal.SIGINFO, toggle_thinking)
+except Exception:
+    pass
+
 try:
     while True:
         try:
-            user = input("\033[1;36myou>\033[0m ")
+            user = input(PROMPT)
         except EOFError:
-            print(); break
+            print()
+            break
         s = user.strip()
-        if not s: continue
-        if s in ("/exit","/quit","exit","quit"): break
+        if not s:
+            continue
+        if s in ("/exit", "/quit", "exit", "quit"):
+            break
         if s == "/reset":
             messages = list(base)
-            print("\033[2m(history cleared)\033[0m"); continue
+            print("\033[2m(history cleared)\033[0m")
+            log("(history cleared)")
+            continue
         messages.append({"role":"user","content":user})
+        log("you> " + user)
         body = json.dumps({"model":model,"messages":messages,"stream":True}).encode()
         req = urllib.request.Request(url, data=body, headers={"Content-Type":"application/json"})
         print("\033[1;35massistant>\033[0m ", end="", flush=True)
         full = ""
-        flt = Filter(strip_think)
+        visible = ""
         try:
             with urllib.request.urlopen(req) as r:
                 for raw in r:
                     line = raw.decode("utf-8", "replace").strip()
-                    if not line.startswith("data:"): continue
+                    if not line.startswith("data:"):
+                        continue
                     data = line[5:].strip()
-                    if data == "[DONE]": break
+                    if data == "[DONE]":
+                        break
                     try:
                         chunk = json.loads(data)
                         delta = chunk["choices"][0]["delta"].get("content","")
                         if delta:
                             full += delta
-                            visible = flt.feed(delta)
-                            if visible:
-                                print(visible, end="", flush=True)
-                    except json.JSONDecodeError:
+                            shown = flt.feed(delta)
+                            if shown:
+                                visible += shown
+                                print(shown, end="", flush=True)
+                    except (json.JSONDecodeError, KeyError, IndexError):
                         pass
             tail = flt.flush()
             if tail:
+                visible += tail
                 print(tail, end="", flush=True)
         except urllib.error.URLError as e:
-            print(f"\n\033[31m[error] {e}\033[0m")
+            print("\n\033[31m[error] %s\033[0m" % e)
             messages.pop()
             continue
         except KeyboardInterrupt:
@@ -233,10 +308,12 @@ try:
         # Keep full (with thinking) in history so the model has context;
         # only display is filtered.
         messages.append({"role":"assistant","content":full})
+        log("assistant> " + visible)
 except KeyboardInterrupt:
     print()
+
 PY
-)" "$url" "$model" "$sysp" "$YMLX_QUICK_THINKING"
+)" "$url" "$model" "$sysp" "$thinking" "$chat_log"
   }
 
   # Pick a beginner-friendly editor: micro > nano > $EDITOR/$VISUAL > vi.
@@ -299,7 +376,7 @@ PY
     {
       if (( ! has_block )); then
         printf '%s\n' \
-          '# >>> ymlx-managed quick settings — edit via "Settings" menu, not by hand <<<' \
+          '# >>> ymlx-managed quick settings — edit via "Settings" (expert mode via Advanced settings) <<<' \
           "YMLX_QUICK_THINKING=${(qq)YMLX_QUICK_THINKING}" \
           "YMLX_QUICK_TEMP=${(qq)YMLX_QUICK_TEMP}" \
           "YMLX_QUICK_MAX_TOKENS=${(qq)YMLX_QUICK_MAX_TOKENS}" \
@@ -313,11 +390,12 @@ PY
         if [[ "$line" == '# >>> ymlx-managed'* ]]; then
           in_block=1
           printf '%s\n' \
-            '# >>> ymlx-managed quick settings — edit via "Settings" menu, not by hand <<<' \
+            '# >>> ymlx-managed quick settings — edit via "Settings" (expert mode via Advanced settings) <<<' \
             "YMLX_QUICK_THINKING=${(qq)YMLX_QUICK_THINKING}" \
             "YMLX_QUICK_TEMP=${(qq)YMLX_QUICK_TEMP}" \
             "YMLX_QUICK_MAX_TOKENS=${(qq)YMLX_QUICK_MAX_TOKENS}" \
             "YMLX_QUICK_SYSTEM_PROMPT=${(qq)YMLX_QUICK_SYSTEM_PROMPT}" \
+            "YMLX_QUICK_EXPERT=${(qq)YMLX_QUICK_EXPERT}" \
             '# <<< end ymlx-managed >>>'
           continue
         fi
@@ -349,27 +427,21 @@ PY
         cur_sys="(none)"
       fi
       local cur_expert="${YMLX_QUICK_EXPERT:-off}"
-      local expert_label
-      if [[ "$cur_expert" == "on" ]]; then
-        expert_label="Turn off expert mode"
-      else
-        expert_label="Turn on expert mode"
-      fi
       local -a settings_entries=(
         "Thinking:       $cur_t"
         "Temperature:    $cur_temp"
         "Max tokens:     $cur_max"
         "System prompt:  $cur_sys"
-        "──────────────"
+        "───────────────────────"
+        "Advanced settings"
+        "Open Local LLM Folder"
       )
-      settings_entries+=( "$expert_label" )
-      [[ "$cur_expert" == "on" ]] && settings_entries+=( "Connect agentic CLI" )
       if [[ "$cur_expert" == "on" ]]; then
-        settings_entries+=("Open local LLM folder" "Advanced settings (edit config.zsh)")
+        settings_entries+=( "Connect agentic CLI" "Turn off expert mode" )
       fi
-      settings_entries+=("Back")
+      settings_entries+=("Back to Top")
       local choice=$(printf "%s\n" "${settings_entries[@]}" | gum choose --header $'\nSettings (current values shown):' --height 14)
-      [[ -z "$choice" || "$choice" == "Back" ]] && return
+      [[ -z "$choice" || "$choice" == "Back to Top" ]] && return
       case "$choice" in
         "Thinking:"*)
           local pick=$(printf "default\non\noff" | gum choose --header "Enable thinking?")
@@ -428,13 +500,10 @@ PY
           fi
           gum input --placeholder "(press enter to continue)" >/dev/null
           ;;
-        "Turn on expert mode")
-          YMLX_QUICK_EXPERT="on"
-          ;;
         "Turn off expert mode")
           YMLX_QUICK_EXPERT="off"
           ;;
-        "Open local LLM folder")
+        "Open Local LLM Folder")
           open "$hub_dir"
           ;;
       esac
@@ -591,18 +660,19 @@ PY
     echo $kb
   }
 
-  # Friendly display name for non-expert users: drop org prefix and the
-  # ubiquitous `-MLX-4bit` style suffix. Expert mode keeps the full HF id.
+  # Friendly display name for non-expert users: drop the org prefix
+  # (e.g. `mlx-community/`). Expert mode keeps the full HF id.
   _ymlx_friendly_name() {
     local id="$1"
     if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
       print -r -- "$id"
       return
     fi
-    local base="${id##*/}"
-    base="${base//-MLX-/-}"
-    base="${base%-MLX}"
-    print -r -- "$base"
+    print -r -- "${id##*/}"
+  }
+
+  _ymlx_display_name() {
+    _ymlx_friendly_name "$1"
   }
 
   _ymlx_format_size() {
@@ -626,7 +696,7 @@ PY
       if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
         echo "No free port in 11500-11519."
       else
-        echo "Port :11500 is busy. Pick the model you want and choose 'Swap'."
+        echo "Port :11500 is busy. Stop the running model (^s in the menu) first."
       fi
       return 1
     fi
@@ -689,15 +759,561 @@ PY
     fi
   }
 
+  _ymlx_download_menu() {
+    local ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
+    local tier_active tier_dim
+    if (( ram_gb >= 24 )); then
+      tier_active=24; tier_dim=16
+    elif (( ram_gb >= 16 )); then
+      tier_active=16; tier_dim=8
+    else
+      tier_active=8; tier_dim=0
+    fi
+
+    typeset -A installed
+    local models m
+    models=$(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
+    for m in ${(f)models}; do installed[$m]=1; done
+
+    local dim_on=$'\e[2m' dim_off=$'\e[0m'
+    typeset -A tier_header
+    local -a entry_tiers=() entry_sources=() entry_tags=() entry_dim=()
+    local source tags block_line=0 line current_tier=0 header num friendly max_w=0 fw
+
+    if [[ -r "$curated_file" ]]; then
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -z "$line" ]]; then
+          block_line=0
+          continue
+        fi
+        if [[ "$line" == *"GB RAM"* ]]; then
+          header="$line"
+          num="${header//[^0-9]/}"
+          tier_header[$num]="$header"
+          current_tier=$num
+          block_line=0
+          continue
+        fi
+        (( block_line++ ))
+        if (( block_line == 1 )); then
+          source="$line"
+        elif (( block_line == 2 )); then
+          tags="$line"
+          if [[ -z "${installed[$source]}" ]]; then
+            if (( current_tier == tier_active || current_tier == tier_dim )); then
+              friendly="${source##*/}"
+              entry_tiers+=( "$current_tier" )
+              entry_sources+=( "$source" )
+              entry_tags+=( "$tags" )
+              entry_dim+=( $(( current_tier == tier_dim )) )
+              fw=${#friendly}
+              (( fw > max_w )) && max_w=$fw
+            fi
+          fi
+          block_line=0
+        fi
+      done < "$curated_file"
+    fi
+    (( max_w < 12 )) && max_w=12
+
+    typeset -A curated
+    local entries=() curated_count=0
+    local prev_tier=-1 hdr_line="" display
+    for (( i=1; i<=${#entry_sources[@]}; i++ )); do
+      if (( entry_tiers[$i] != prev_tier )); then
+        if (( entry_tiers[$i] == tier_dim )); then
+          hdr_line="${dim_on}  # ${tier_header[${entry_tiers[$i]}]}${dim_off}"
+        else
+          hdr_line="  # ${tier_header[${entry_tiers[$i]}]}"
+        fi
+        entries+=("$hdr_line")
+        prev_tier=${entry_tiers[$i]}
+      fi
+      friendly="${entry_sources[$i]##*/}"
+      if (( entry_dim[$i] )); then
+        display="${dim_on}$(printf '    %-*s  // %s' "$max_w" "$friendly" "${entry_tags[$i]}")${dim_off}"
+      else
+        display=$(printf '    %-*s  // %s' "$max_w" "$friendly" "${entry_tags[$i]}")
+      fi
+      entries+=("$display")
+      curated[$display]="${entry_sources[$i]}"
+      (( curated_count++ ))
+    done
+
+    if (( curated_count == 0 )); then
+      entries+=("    No more hand picked models available")
+    fi
+    entries+=("    ──────────────────────────────────────────" "    Custom            (paste HuggingFace ID)…" "    Back to Top")
+
+    local pick=$(printf "%s\n" "${entries[@]}" | gum choose --header $'\nDownload new model:' --height 30)
+    [[ -z "$pick" ]] && return
+
+    if [[ "$pick" == *"Back to Top"* || "$pick" == *──* || "$pick" == *"No more hand picked models available"* ]]; then
+      return
+    fi
+
+    local model
+    if [[ "$pick" == *"Custom"* ]]; then
+      model=$(gum input --placeholder "e.g. mlx-community/Ministral-3-3B-Instruct-2512-4bit" --prompt "Model: ")
+    else
+      model="${curated[$pick]}"
+    fi
+    [[ -z "$model" ]] && return
+    echo
+    gum style --foreground 212 --bold "Downloading $model"
+    echo "(progress will stream below — Ctrl-C to abort)"
+    echo
+    if uvx --from mlx-lm python3 -c "from mlx_lm import load; load('$model')"; then
+      echo
+      gum style --foreground 42 "✓ Downloaded: $model"
+      echo
+      if gum confirm "Start $model now?"; then
+        _ymlx_launch "$model"
+        _preselect_model="$model"
+      fi
+    else
+      echo
+      gum style --foreground 196 "✗ Download failed or cancelled."
+      gum input --placeholder "(press enter to continue)" >/dev/null
+    fi
+  }
+
+  _ymlx_chat_history_menu() {
+    while true; do
+      local -a hist_entries=()
+      typeset -A hist_files
+      local f friendly started label
+      local -a chat_files=( "$chat_dir"/*.txt(N) )
+      local -a sorted_files=( ${(On)chat_files} )
+      for f in "${sorted_files[@]}"; do
+        friendly=$(sed -n 's/^# Chat with //p' "$f" | head -n1 | sed 's/ on :[0-9]*$//')
+        started=$(sed -n 's/^# Started: //p' "$f" | head -n1)
+        [[ -z "$friendly" ]] && friendly="${f:t}"
+        [[ -z "$started" ]] && started="${f:t:r}"
+        label="$friendly  —  $started"
+        hist_entries+=("$label")
+        hist_files[$label]="$f"
+      done
+      if (( ${#hist_entries[@]} == 0 )); then
+        hist_entries+=("No chats yet.")
+      fi
+      hist_entries+=("──────────────" "Clear history" "Back to Top")
+      local pick=$(printf "%s\n" "${hist_entries[@]}" | gum choose --header $'\nChat History:' --height 20)
+      [[ -z "$pick" ]] && return
+      if [[ "$pick" == "Back to Top" || "$pick" == *──* || "$pick" == "No chats yet." ]]; then
+        return
+      fi
+      if [[ "$pick" == "Clear history" ]]; then
+        if gum confirm "Delete all chat history?"; then
+          rm -f "$chat_dir"/*.txt(N)
+          echo "Chat history cleared."
+        fi
+        continue
+      fi
+      local file="${hist_files[$pick]}"
+      [[ -n "$file" && -f "$file" ]] && gum pager < "$file"
+    done
+  }
+
+  _ymlx_main_build() {
+    local pid port model models m friendly rport think_suffix display first_running_idx=-1
+    _YMLX_MENU_LINES=()
+    _YMLX_MENU_KINDS=()
+    _YMLX_MENU_MODELS=()
+    _YMLX_MENU_PORTS=()
+    _YMLX_MENU_ACTIONS=()
+    typeset -A running_for_model
+    while IFS=$'\t' read -r pid port model; do
+      [[ -z "$pid" ]] && continue
+      running_for_model[$model]="$pid"$'\t'"$port"
+    done < <(_ymlx_running)
+
+    _YMLX_MENU_NO_MODELS=0
+    models=$(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
+    if [[ -z "$models" ]]; then
+      _YMLX_MENU_NO_MODELS=1
+      _YMLX_MENU_LINES=( "Download your first model" "Chat History" "Settings" "Quit" )
+      _YMLX_MENU_KINDS=( "action" "action" "action" "action" )
+      _YMLX_MENU_MODELS=( "" "" "" "" )
+      _YMLX_MENU_PORTS=( "" "" "" "" )
+      _YMLX_MENU_ACTIONS=( "download" "history" "settings" "quit" )
+    else
+      for m in ${(f)models}; do
+        friendly=$(_ymlx_display_name "$m")
+        if [[ -n "${running_for_model[$m]}" ]]; then
+          rport="${running_for_model[$m]##*	}"
+          think_suffix=""
+          [[ "$YMLX_QUICK_THINKING" == "on" ]] && think_suffix=" thinking"
+          [[ "$YMLX_QUICK_THINKING" == "off" ]] && think_suffix=" thinking off"
+          display="● $friendly$think_suffix"
+          _YMLX_MENU_LINES+=( "$display" )
+          _YMLX_MENU_KINDS+=( "model" )
+          _YMLX_MENU_MODELS+=( "$m" )
+          _YMLX_MENU_PORTS+=( "$rport" )
+          _YMLX_MENU_ACTIONS+=( "" )
+          (( first_running_idx < 0 )) && first_running_idx=$(( ${#_YMLX_MENU_LINES[@]} - 1 ))
+        else
+          _YMLX_MENU_LINES+=( "$friendly" )
+          _YMLX_MENU_KINDS+=( "model" )
+          _YMLX_MENU_MODELS+=( "$m" )
+          _YMLX_MENU_PORTS+=( "" )
+          _YMLX_MENU_ACTIONS+=( "" )
+        fi
+      done
+      _YMLX_MENU_LINES+=( "──────────────────────" )
+      _YMLX_MENU_KINDS+=( "separator" )
+      _YMLX_MENU_MODELS+=( "" ); _YMLX_MENU_PORTS+=( "" ); _YMLX_MENU_ACTIONS+=( "" )
+      _YMLX_MENU_LINES+=( "Chat History" "Settings" "Download" "Quit" )
+      _YMLX_MENU_KINDS+=( "action" "action" "action" "action" )
+      _YMLX_MENU_MODELS+=( "" "" "" "" ); _YMLX_MENU_PORTS+=( "" "" "" "" )
+      _YMLX_MENU_ACTIONS+=( "history" "settings" "download" "quit" )
+    fi
+    _YMLX_MENU_SCROLL=0
+    if (( first_running_idx >= 0 )); then
+      _YMLX_MENU_CURSOR=$first_running_idx
+    else
+      _YMLX_MENU_CURSOR=0
+    fi
+    _ymlx_main_scroll_cursor
+  }
+
+  _ymlx_main_render() {
+    local i idx line prefix kind n end footer has_running=0
+    if (( _YMLX_MENU_DRAWN )); then
+      print -n -- "\033[${_YMLX_MENU_NLINES}A\033[J"
+    fi
+    local -a out=()
+    if (( _YMLX_MENU_NO_MODELS )); then
+      out+=( $'\e[1;35mNo models installed yet.\e[0m' )
+    else
+      out+=( $'\e[1;35mSelect model:\e[0m' )
+    fi
+    n=${#_YMLX_MENU_LINES[@]}
+    end=$(( _YMLX_MENU_SCROLL + _YMLX_MENU_VIS ))
+    (( end > n )) && end=n
+    for (( i=_YMLX_MENU_SCROLL; i<end; i++ )); do
+      idx=$i
+      line="${_YMLX_MENU_LINES[$((idx+1))]}"
+      kind="${_YMLX_MENU_KINDS[$((idx+1))]}"
+      prefix="  "
+      if (( idx == _YMLX_MENU_CURSOR )); then
+        prefix="> "
+      fi
+      if [[ "$kind" == "separator" ]]; then
+        out+=( $'\e[2m'"$line"$'\e[0m' )
+      elif (( idx == _YMLX_MENU_CURSOR )); then
+        out+=( $'\e[1;36m'"$prefix$line"$'\e[0m' )
+      else
+        out+=( "$prefix$line" )
+      fi
+    done
+    for (( i=1; i<=${#_YMLX_MENU_PORTS[@]}; i++ )); do
+      [[ -n "${_YMLX_MENU_PORTS[$i]}" ]] && { has_running=1; break; }
+    done
+    local footer_text
+    if (( has_running )); then
+      footer_text="↓↑ navigate • enter submit/start • tab toggle thinking • ^s stop server • ^d delete • esc back • ^q quit"
+    else
+      footer_text="↓↑ navigate • enter submit/start • ^d delete • esc back • ^q quit"
+    fi
+    footer_text="${footer_text:0:$(( _YMLX_MENU_WIDTH - 1 ))}"
+    out+=( $'\e[2m'"$footer_text"$'\e[0m' )
+    _YMLX_MENU_NLINES=0
+    for line in "${out[@]}"; do
+      print -n -- "$line\033[K\n"
+      (( _YMLX_MENU_NLINES++ ))
+    done
+    _YMLX_MENU_DRAWN=1
+  }
+
+  _ymlx_main_clear() {
+    if (( _YMLX_MENU_DRAWN )); then
+      print -n -- "\033[${_YMLX_MENU_NLINES}A\033[J"
+      _YMLX_MENU_DRAWN=0
+    fi
+  }
+
+  _ymlx_main_full_render() {
+    print -n -- "\033[2J\033[H"
+    _YMLX_MENU_DRAWN=0
+    echo
+    gum style --foreground 212 --bold "▌▌ YMLX"
+    gum style --foreground 244 "Runs an MLX model behind an OpenAI-compatible REST API at localhost:11500"
+    _ymlx_main_render
+  }
+
+  _ymlx_main_scroll_cursor() {
+    local n=${#_YMLX_MENU_LINES[@]} max_scroll=$(( n - _YMLX_MENU_VIS ))
+    (( max_scroll < 0 )) && max_scroll=0
+    (( _YMLX_MENU_SCROLL > max_scroll )) && _YMLX_MENU_SCROLL=$max_scroll
+    if (( _YMLX_MENU_CURSOR < _YMLX_MENU_SCROLL )); then
+      _YMLX_MENU_SCROLL=$_YMLX_MENU_CURSOR
+    elif (( _YMLX_MENU_CURSOR >= _YMLX_MENU_SCROLL + _YMLX_MENU_VIS )); then
+      _YMLX_MENU_SCROLL=$(( _YMLX_MENU_CURSOR - _YMLX_MENU_VIS + 1 ))
+    fi
+    (( _YMLX_MENU_SCROLL < 0 )) && _YMLX_MENU_SCROLL=0
+  }
+
+  _ymlx_main_move() {
+    local delta="$1" n=${#_YMLX_MENU_LINES[@]} new=$_YMLX_MENU_CURSOR
+    while true; do
+      new=$(( new + delta ))
+      if (( new < 0 )); then return; fi
+      if (( new >= n )); then return; fi
+      if [[ "${_YMLX_MENU_KINDS[$((new+1))]}" != "separator" ]]; then
+        _YMLX_MENU_CURSOR=$new
+        break
+      fi
+    done
+    _ymlx_main_scroll_cursor
+  }
+
+  _ymlx_main_rebuild_preserving() {
+    local kind="${_YMLX_MENU_KINDS[$((_YMLX_MENU_CURSOR+1))]}"
+    local model="${_YMLX_MENU_MODELS[$((_YMLX_MENU_CURSOR+1))]}"
+    local action="${_YMLX_MENU_ACTIONS[$((_YMLX_MENU_CURSOR+1))]}"
+    _ymlx_main_build
+    local i
+    for (( i=1; i<=${#_YMLX_MENU_KINDS[@]}; i++ )); do
+      if [[ "${_YMLX_MENU_KINDS[$i]}" == "$kind" && "${_YMLX_MENU_MODELS[$i]}" == "$model" && "${_YMLX_MENU_ACTIONS[$i]}" == "$action" ]]; then
+        _YMLX_MENU_CURSOR=$(( i - 1 ))
+        break
+      fi
+    done
+    _ymlx_main_scroll_cursor
+    _ymlx_main_render
+  }
+
+  _ymlx_main_rebuild_full() {
+    local kind="${_YMLX_MENU_KINDS[$((_YMLX_MENU_CURSOR+1))]}"
+    local model="${_YMLX_MENU_MODELS[$((_YMLX_MENU_CURSOR+1))]}"
+    local action="${_YMLX_MENU_ACTIONS[$((_YMLX_MENU_CURSOR+1))]}"
+    _ymlx_main_build
+    local i
+    for (( i=1; i<=${#_YMLX_MENU_KINDS[@]}; i++ )); do
+      if [[ "${_YMLX_MENU_KINDS[$i]}" == "$kind" && "${_YMLX_MENU_MODELS[$i]}" == "$model" && "${_YMLX_MENU_ACTIONS[$i]}" == "$action" ]]; then
+        _YMLX_MENU_CURSOR=$(( i - 1 ))
+        break
+      fi
+    done
+    _ymlx_main_scroll_cursor
+    _ymlx_main_full_render
+  }
+
+  _ymlx_main_toggle_thinking() {
+    local kind="${_YMLX_MENU_KINDS[$((_YMLX_MENU_CURSOR+1))]}"
+    [[ "$kind" != "model" ]] && return
+    if [[ "$YMLX_QUICK_THINKING" == "on" ]]; then
+      YMLX_QUICK_THINKING="off"
+    else
+      YMLX_QUICK_THINKING="on"
+    fi
+    _ymlx_write_managed_block "$config_file"
+    _ymlx_reload_config
+    _ymlx_main_rebuild_preserving
+  }
+
+  _ymlx_main_stop() {
+    local idx=$(( _YMLX_MENU_CURSOR + 1 ))
+    local kind="${_YMLX_MENU_KINDS[$idx]}"
+    local port="${_YMLX_MENU_PORTS[$idx]}"
+    local model="${_YMLX_MENU_MODELS[$idx]}"
+    if [[ "$kind" != "model" || -z "$port" ]]; then
+      return
+    fi
+    _ymlx_main_clear
+    local pid _p _pt _m
+    while IFS=$'\t' read -r _p _pt _m; do
+      if [[ "$_m" == "$model" && "$_pt" == "$port" ]]; then
+        pid="$_p"
+        break
+      fi
+    done < <(_ymlx_running)
+    if [[ -n "$pid" ]]; then
+      kill "$pid" 2>/dev/null && echo "Stopped: $model on :$port"
+      _ymlx_drop "$pid"
+    else
+      echo "Server for $model was already gone."
+    fi
+    _ymlx_main_rebuild_full
+  }
+
+  _ymlx_main_delete() {
+    local idx=$(( _YMLX_MENU_CURSOR + 1 ))
+    local kind="${_YMLX_MENU_KINDS[$idx]}"
+    local model="${_YMLX_MENU_MODELS[$idx]}"
+    local port="${_YMLX_MENU_PORTS[$idx]}"
+    if [[ "$kind" != "model" ]]; then
+      return
+    fi
+    _ymlx_main_clear
+    local folder="$hub_dir/models--${model//\//--}"
+    if [[ ! -d "$folder" ]]; then
+      echo "Folder not found: $folder"
+    else
+      local warn=""
+      [[ -n "$port" ]] && warn=" (running server will be stopped first)"
+      if gum confirm "Remove $model from $hub_dir?$warn"; then
+        if [[ -n "$port" ]]; then
+          local pid _p _pt _m
+          while IFS=$'\t' read -r _p _pt _m; do
+            if [[ "$_m" == "$model" && "$_pt" == "$port" ]]; then
+              pid="$_p"; break
+            fi
+          done < <(_ymlx_running)
+          [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && _ymlx_drop "$pid"
+        fi
+        rm -rf "$folder"
+        unset "_ymlx_size_mt[$model]" "_ymlx_size_kb[$model]"
+        _ymlx_size_save
+        echo "Removed: $model"
+      fi
+    fi
+    _ymlx_main_rebuild_full
+  }
+
+  _ymlx_main_quit() {
+    _ymlx_main_clear
+    if gum confirm "Quit ymlx and stop all running models?"; then
+      _ymlx_stop_all >/dev/null 2>&1
+      _YMLX_MENU_QUIT=1
+      return 0
+    fi
+    _ymlx_main_full_render
+    return 1
+  }
+
+  _ymlx_main_activate() {
+    local idx=$(( _YMLX_MENU_CURSOR + 1 ))
+    local kind="${_YMLX_MENU_KINDS[$idx]}"
+    local model="${_YMLX_MENU_MODELS[$idx]}"
+    local port="${_YMLX_MENU_PORTS[$idx]}"
+    local action="${_YMLX_MENU_ACTIONS[$idx]}"
+    [[ "$kind" == "separator" ]] && return
+    _ymlx_main_clear
+    if [[ "$kind" == "model" ]]; then
+      if [[ -n "$port" ]]; then
+        _ymlx_chat_repl "$model" "$port"
+      else
+        local _occ_pid="" _occ_model="" _p _pt _m
+        while IFS=$'\t' read -r _p _pt _m; do
+          if [[ "$_pt" == "11500" ]]; then
+            _occ_pid="$_p"; _occ_model="$_m"
+            break
+          fi
+        done < <(_ymlx_running)
+        if [[ -n "$_occ_pid" ]]; then
+          echo "Port :11500 is busy running $_occ_model."
+          echo "Stop it with ^s, then try again."
+          gum input --placeholder "(press enter to continue)" >/dev/null
+        else
+          _ymlx_launch "$model"
+          _preselect_model="$model"
+        fi
+      fi
+    else
+      case "$action" in
+        download) _ymlx_download_menu ;;
+        history) _ymlx_chat_history_menu ;;
+        settings) _ymlx_settings_menu ;;
+        quit) _ymlx_main_quit ;;
+      esac
+    fi
+    (( _YMLX_MENU_QUIT )) && return
+    if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
+      _YMLX_MENU_EXPERT=1
+      return
+    fi
+    _ymlx_main_rebuild_full
+  }
+
+  _ymlx_main_read_key() {
+    local k1 k2 k3
+    read -s -k1 k1
+    local st=$?
+    if (( st != 0 )); then
+      _YMLX_MENU_KEY=""
+      return
+    fi
+    if [[ "$k1" == $'\e' ]]; then
+      if read -s -k1 -t 0.05 k2; then
+        if read -s -k1 -t 0.05 k3; then
+          _YMLX_MENU_KEY=$'\e'"$k2$k3"
+        else
+          _YMLX_MENU_KEY=$'\e'"$k2"
+        fi
+      else
+        _YMLX_MENU_KEY=$'\e'
+      fi
+    else
+      _YMLX_MENU_KEY="$k1"
+    fi
+  }
+
+  _ymlx_main_standard() {
+    local _up1=$'\e'[A _up2=$'\e'OA _down1=$'\e'[B _down2=$'\e'OB
+    local _term_lines=${LINES:-24}
+    (( _term_lines < 8 )) && _term_lines=24
+    _YMLX_MENU_VIS=$(( _term_lines - 6 ))
+    (( _YMLX_MENU_VIS < 1 )) && _YMLX_MENU_VIS=1
+    _YMLX_MENU_WIDTH=${COLUMNS:-80}
+    (( _YMLX_MENU_WIDTH < 40 )) && _YMLX_MENU_WIDTH=80
+    (( _YMLX_MENU_VIS < 1 )) && _YMLX_MENU_VIS=1
+    _YMLX_MENU_QUIT=0
+    _YMLX_MENU_EXPERT=0
+    _YMLX_MENU_DRAWN=0
+    _YMLX_MENU_NLINES=0
+    stty -ixon 2>/dev/null
+    _ymlx_main_build
+    _ymlx_main_render
+    while true; do
+      _ymlx_main_read_key
+      if [[ -z "$_YMLX_MENU_KEY" ]]; then
+        _ymlx_stop_all >/dev/null 2>&1
+        _YMLX_MENU_QUIT=1
+        break
+      fi
+      local key="$_YMLX_MENU_KEY"
+      if [[ "$key" == "$_up1" || "$key" == "$_up2" ]]; then
+        _ymlx_main_move -1
+        _ymlx_main_render
+      elif [[ "$key" == "$_down1" || "$key" == "$_down2" ]]; then
+        _ymlx_main_move 1
+        _ymlx_main_render
+      elif [[ "$key" == $'\n' || "$key" == $'\r' ]]; then
+        _ymlx_main_activate
+        (( _YMLX_MENU_QUIT )) && break
+        (( _YMLX_MENU_EXPERT )) && return 0
+      elif [[ "$key" == $'\t' ]]; then
+        _ymlx_main_toggle_thinking
+      elif [[ "$key" == $'\x13' ]]; then
+        _ymlx_main_stop
+      elif [[ "$key" == $'\x04' ]]; then
+        _ymlx_main_delete
+      elif [[ "$key" == $'\x11' || "$key" == $'\e' ]]; then
+        if _ymlx_main_quit; then
+          break
+        fi
+      fi
+    done
+  }
+
   local models selected
   local _preselect_model=""
   [[ -f "$last_model_file" ]] && _preselect_model="$(<"$last_model_file")"
 
+  clear
   echo
   gum style --foreground 212 --bold "▌▌ YMLX"
   gum style --foreground 244 "Runs an MLX model behind an OpenAI-compatible REST API at localhost:11500"
 
   while true; do
+    if [[ "$YMLX_QUICK_EXPERT" != "on" ]]; then
+      _ymlx_main_standard
+      (( _YMLX_MENU_QUIT )) && return
+      continue
+    fi
+
     models=$(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
 
     local main_entries=() pid="" port="" model="" display="" rss_h="" _preselect_display=""
@@ -949,112 +1565,7 @@ PY
       gum input --placeholder "(press enter to continue)" >/dev/null
       continue
     elif [[ "$selected" == "Download" ]]; then
-      local script_dir="${${(%):-%x}:A:h}"
-      local curated_file="$script_dir/curated-llms.md"
-
-      local ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
-      local tier_active tier_dim
-      if (( ram_gb >= 24 )); then
-        tier_active=24; tier_dim=16
-      elif (( ram_gb >= 16 )); then
-        tier_active=16; tier_dim=8
-      else
-        tier_active=8; tier_dim=0
-      fi
-
-      typeset -A installed
-      local m
-      for m in ${(f)models}; do installed[$m]=1; done
-
-      typeset -A curated
-      local entries=() curated_count=0
-      local dim_on=$'\e[2m' dim_off=$'\e[0m'
-      local source="" tags="" block_line=0 line current_tier=0 header num display pending_header=""
-
-      if [[ -r "$curated_file" ]]; then
-        while IFS= read -r line || [[ -n "$line" ]]; do
-          if [[ -z "$line" ]]; then
-            block_line=0
-            continue
-          fi
-          if [[ "$line" == *"GB RAM"* ]]; then
-            header="${line%:}"
-            num="${header//[^0-9]/}"
-            current_tier=$num
-            if (( num == tier_active )); then
-              pending_header="── ${header} ──"
-            elif (( num == tier_dim )); then
-              pending_header="${dim_on}── ${header} ──${dim_off}"
-            else
-              pending_header=""
-            fi
-            block_line=0
-            continue
-          fi
-          (( block_line++ ))
-          if (( block_line == 1 )); then
-            source="$line"
-          elif (( block_line == 2 )); then
-            tags="$line"
-            if [[ -z "${installed[$source]}" ]]; then
-              if (( current_tier == tier_active )); then
-                display="$source — $tags"
-              elif (( current_tier == tier_dim )); then
-                display="${dim_on}$source — $tags${dim_off}"
-              else
-                display=""
-              fi
-              if [[ -n "$display" ]]; then
-                if [[ -n "$pending_header" ]]; then
-                  entries+=("$pending_header")
-                  pending_header=""
-                fi
-                entries+=("$display")
-                curated[$display]="$source"
-                (( curated_count++ ))
-              fi
-            fi
-          fi
-        done < "$curated_file"
-      fi
-
-      if (( curated_count == 0 )); then
-        entries+=("No more hand picked models available")
-      fi
-      entries+=("──────────────" "Custom (paste HuggingFace ID)…" "Back")
-
-      local pick=$(printf "%s\n" "${entries[@]}" | gum choose --header $'\nDownload new model:' --height 30)
-      [[ -z "$pick" ]] && continue
-
-      if [[ "$pick" == "Back" || "$pick" == *──* || "$pick" == "No more hand picked models available" ]]; then
-        continue
-      fi
-
-      local model
-      if [[ "$pick" == "Custom (paste HuggingFace ID)…" ]]; then
-        model=$(gum input --placeholder "e.g. mlx-community/Ministral-3-3B-Instruct-2512-4bit" --prompt "Model: ")
-      else
-        local clean=$(print -r -- "$pick" | sed $'s/\x1b\\[[0-9;]*m//g')
-        model="${clean%% — *}"
-      fi
-      [[ -z "$model" ]] && continue
-      echo
-      gum style --foreground 212 --bold "Downloading $model"
-      echo "(progress will stream below — Ctrl-C to abort)"
-      echo
-      if uvx --from mlx-lm python3 -c "from mlx_lm import load; load('$model')"; then
-        echo
-        gum style --foreground 42 "✓ Downloaded: $model"
-        echo
-        if gum confirm "Start $model now?"; then
-          _ymlx_launch "$model"
-          _preselect_model="$model"
-        fi
-      else
-        echo
-        gum style --foreground 196 "✗ Download failed or cancelled."
-        gum input --placeholder "(press enter to continue)" >/dev/null
-      fi
+      _ymlx_download_menu
       continue
     fi
 
@@ -1163,6 +1674,7 @@ _ymlx_cleanup() {
   for pid in "${_YMLX_SESSION_PIDS[@]}"; do
     [[ -n "$pid" ]] && kill "$pid" 2>/dev/null
   done
+  [[ -n "$_YMLX_STTY_SAVED" ]] && stty "$_YMLX_STTY_SAVED" 2>/dev/null
 }
 trap _ymlx_cleanup EXIT INT TERM HUP
 

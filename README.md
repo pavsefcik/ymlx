@@ -5,12 +5,13 @@ Exposes an OpenAI-compatible REST API at `localhost:11500`.
 
 ## What it does
 
-- Lists installed models from `~/.cache/huggingface/hub` with per-model disk size and a running total
-- Runs the selected model on `:11500` via `mlx-lm` — one model at a time
-- **Swap** replaces the active model without touching the URL — your other apps stay configured
+- Lists installed models from `~/.cache/huggingface/hub` (expert mode adds per-model disk size and a running total)
+- Runs the selected model on `:11500` via `mlx-lm` — one model at a time; Enter starts it or opens chat
+- **Swap** replaces the active model without touching the URL — your other apps stay configured (expert mode)
 - Three-phase loading spinner (initialize → load weights → warm up); cancellable mid-load
-- Built-in chat REPL with optional `<think>` tag hiding
-- Copy-paste **Use from another app** screen showing base URL / model id / API key
+- Built-in chat REPL with optional `<think>` tag hiding and `^t` thinking toggle
+- Chat history viewer in the main menu
+- Copy-paste **Use from another app** screen showing base URL / model id / API key (shown after launch; also an item in expert mode)
 - Downloads new models — curated list filtered to your machine's RAM tier, or a pasted HuggingFace ID
 - Cleans up automatically — closing the terminal tab stops the running server
 
@@ -39,7 +40,7 @@ Then run `ymlx` in any shell.
 
 ## Use from another app
 
-Once a model is running, pick **Use from another app** in the running-model submenu for a copy-pasteable summary. Three values are all most apps need:
+Once a model is running, ymlx prints a **Use from another app** summary after launch. In expert mode you can also pick it from the running-model submenu. Three values are all most apps need:
 
 - **Base URL:** `http://localhost:11500/v1`
 - **Model:** the HuggingFace id of whatever is running (e.g. `mlx-community/Qwen3.5-4B-MLX-4bit`)
@@ -56,27 +57,27 @@ Pick **Settings** from the main menu for the four quick toggles you'll actually 
 - **Max tokens** — preset (512 / 2048 / 8192 / 32768) or custom
 - **System prompt** — multi-line `gum write` editor; chat only
 
-These persist in a managed block at the top of `~/.cache/ymlx/config.zsh` (auto-created on first run; Thinking starts at `off` since it's the value most users want). Settings is the first item in the main menu and in every per-model action menu, so it's always one keystroke away.
+These persist in a managed block at the top of `~/.cache/ymlx/config.zsh` (auto-created on first run; Thinking starts at `off` since it's the value most users want). Settings is in the main menu (and in the expert-mode per-model action menu), so it's always one keystroke away. In the standard main menu, navigate with ↑/↓, press Enter to start or chat, Tab to toggle thinking, `^s` to stop the running server, `^d` to delete the selected model, and `^q` (or Esc) to quit.
 
 Selecting **Advanced settings** inside Settings opens the config file in your editor — `micro` if installed, otherwise `nano`, then `$VISUAL` / `$EDITOR`, finally `vi`. Below the managed block live two arrays, `YMLX_CHAT_FLAGS` and `YMLX_SERVER_FLAGS`, with every flag from `mlx_lm.chat --help` / `mlx_lm.server --help` listed (commented out by default): `--draft-model`, `--seed`, `--top-k` / `--min-p`, `--xtc-*`, concurrency knobs, adapter paths, etc. `--model`, `--port`, and `--host` stay managed by ymlx. Changes take effect immediately on save — no ymlx restart needed.
 
 ## Curated model list
 
-The "Download new model" submenu is populated from [`curated-llms.md`](curated-llms.md). Edit that file to add or remove entries.
+The "Download new model" submenu is populated from [ymlx-curator](https://github.com/pavsefcik/ymlx-curator), a standalone repo that keeps the list up to date even when ymlx itself isn't. ymlx pulls the latest [`ymlx-curator.md`](https://github.com/pavsefcik/ymlx-curator/blob/main/ymlx-curator.md) from GitHub at every startup and caches it in `~/.cache/ymlx/curated-llms.md` (the last good copy is used if you're offline). To add or remove entries, edit the file in the ymlx-curator repo.
 
-Format: blank-line-separated 2-line blocks under a tier header.
+Format: blank-line-separated 2-line blocks under a tier header. The first line is the HuggingFace id used for downloading, and the second is the tag list shown in the menu.
 
 ```
-if 8 GB RAM:
+8 GB RAM Tier Models
 
-mlx-community/Some-Model-ID
-tag1, tag2
+mlx-community/Qwen3.5-4B-MLX-4bit
+vision, reasoning
 
-mlx-community/Another-Model-ID
-tag1, tag2
+mlx-community/gemma-4-e4b-it-4bit
+vision, audio
 
 
-if 16 GB RAM:
+16 GB RAM Tier Models
 
 ...
 ```
@@ -93,7 +94,7 @@ Models already present in `~/.cache/huggingface/hub` are filtered out of the lis
 
 ## Expert mode
 
-Turn on **Settings → Turn on expert mode** to unlock multi-server workflows and raw mlx-lm commands. ymlx stops pinning to `:11500` — each launch picks the next free port in `11500–11519`.
+Turn on expert mode by opening **Settings → Advanced settings** and setting `YMLX_QUICK_EXPERT="on"` in the managed block, then save. This unlocks multi-server workflows and raw mlx-lm commands. ymlx stops pinning to `:11500` — each launch picks the next free port in `11500–11519`.
 
 The installed-model submenu grows:
 
