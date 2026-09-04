@@ -8,6 +8,9 @@ unsetopt xtrace verbose 2>/dev/null
 # here, so we won't kill what we didn't start.
 typeset -ga _YMLX_SESSION_PIDS=()
 
+# Self-contained helpers (no dependence on ymlx()'s locals) live in lib/.
+source "${0:A:h}/lib/ymlx-helpers.zsh"
+
 ymlx() {
   local YMLX_DEBUG=false
   local hub_dir=~/.cache/huggingface/hub
@@ -316,33 +319,6 @@ PY
 )" "$url" "$model" "$sysp" "$thinking" "$chat_log"
   }
 
-  # Pick a beginner-friendly editor: micro > nano > $EDITOR/$VISUAL > vi.
-  _ymlx_pick_editor() {
-    if command -v micro >/dev/null 2>&1; then echo micro
-    elif command -v nano >/dev/null 2>&1; then echo nano
-    elif [[ -n "$VISUAL" ]] && command -v "${VISUAL%% *}" >/dev/null 2>&1; then echo "$VISUAL"
-    elif [[ -n "$EDITOR" ]] && command -v "${EDITOR%% *}" >/dev/null 2>&1; then echo "$EDITOR"
-    else echo vi
-    fi
-  }
-
-  # Replace --flag value in a named array, or append if absent.
-  _ymlx_replace_or_append() {
-    local name="$1" flag="$2" value="$3"
-    local -a arr
-    eval "arr=( \"\${${name}[@]}\" )"
-    local i found=0
-    for (( i=1; i<=${#arr[@]}; i++ )); do
-      if [[ "${arr[i]}" == "$flag" ]]; then
-        arr[i+1]="$value"
-        found=1
-        break
-      fi
-    done
-    (( found )) || arr+=( "$flag" "$value" )
-    eval "${name}=( \"\${arr[@]}\" )"
-  }
-
   _ymlx_apply_quick() {
     local cta=""
     case "$YMLX_QUICK_THINKING" in
@@ -590,104 +566,7 @@ print(f"Synced {len(ids)} model(s) into {cf}")
 PY
   }
 
-  _ymlx_port_free() {
-    ! lsof -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
-  }
-
-  _ymlx_find_port() {
-    if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
-      local p=11500
-      while (( p <= 11519 )); do
-        _ymlx_port_free "$p" && { echo "$p"; return; }
-        (( p++ ))
-      done
-      echo ""
-      return 1
-    fi
-    # Standard mode: agentic CLIs talk to :11500 — only that port is allowed.
-    # Caller (Swap) is expected to free it before launch.
-    if _ymlx_port_free 11500; then
-      echo 11500
-    else
-      echo ""
-      return 1
-    fi
-  }
-
-  _ymlx_rss_h() {
-    local rss_kb=$(ps -o rss= -p "$1" 2>/dev/null | tr -d ' ')
-    [[ -z "$rss_kb" || "$rss_kb" == 0 ]] && { echo "?"; return; }
-    if (( rss_kb >= 1048576 )); then
-      printf '%.1fG' "$(( rss_kb / 1048576.0 ))"
-    else
-      printf '%dM' "$(( rss_kb / 1024 ))"
-    fi
-  }
-
-  typeset -gA _ymlx_size_mt _ymlx_size_kb
-  _ymlx_size_load() {
-    [[ -f "$size_cache_file" ]] || return
-    local m mt kb
-    while IFS=$'\t' read -r m mt kb; do
-      [[ -z "$m" ]] && continue
-      _ymlx_size_mt[$m]=$mt
-      _ymlx_size_kb[$m]=$kb
-    done < "$size_cache_file"
-  }
-
-  _ymlx_size_save() {
-    local tmp="$size_cache_file.tmp" m
-    : > "$tmp"
-    for m in ${(k)_ymlx_size_kb}; do
-      printf '%s\t%s\t%s\n' "$m" "${_ymlx_size_mt[$m]}" "${_ymlx_size_kb[$m]}" >> "$tmp"
-    done
-    mv "$tmp" "$size_cache_file"
-  }
-
-  _ymlx_disk_kb() {
-    local model="$1"
-    local folder="$hub_dir/models--${model//\//--}"
-    [[ -d "$folder" ]] || { echo 0; return; }
-    local mt=$(stat -f %m "$folder" 2>/dev/null)
-    if [[ "${_ymlx_size_mt[$model]}" == "$mt" && -n "${_ymlx_size_kb[$model]}" ]]; then
-      echo "${_ymlx_size_kb[$model]}"
-      return
-    fi
-    local kb=$(du -sk "$folder" 2>/dev/null | awk '{print $1}')
-    _ymlx_size_mt[$model]=$mt
-    _ymlx_size_kb[$model]=$kb
-    _ymlx_size_save
-    echo $kb
-  }
-
-  # Friendly display name for non-expert users: drop the org prefix
-  # (e.g. `mlx-community/`). Expert mode keeps the full HF id.
-  _ymlx_friendly_name() {
-    local id="$1"
-    if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
-      print -r -- "$id"
-      return
-    fi
-    print -r -- "${id##*/}"
-  }
-
-  _ymlx_display_name() {
-    _ymlx_friendly_name "$1"
-  }
-
-  _ymlx_format_size() {
-    local kb=$1
-    if (( kb <= 0 )); then echo "?"; return; fi
-    if (( kb >= 1048576 )); then
-      printf '%.1fG' "$(( kb / 1048576.0 ))"
-    elif (( kb >= 1024 )); then
-      printf '%dM' "$(( kb / 1024 ))"
-    else
-      printf '%dK' "$kb"
-    fi
-  }
-
-  _ymlx_size_load
+  _ymlx_size_load "$size_cache_file"
 
   _ymlx_launch() {
     local model="$1"
@@ -1165,7 +1044,7 @@ PY
         fi
         rm -rf "$folder"
         unset "_ymlx_size_mt[$model]" "_ymlx_size_kb[$model]"
-        _ymlx_size_save
+        _ymlx_size_save "$size_cache_file"
         echo "Removed: $model"
       fi
     fi
@@ -1328,7 +1207,7 @@ PY
     typeset -A model_kb
     if [[ -n "$models" ]]; then
       for m in ${(f)models}; do
-        m_kb=$(_ymlx_disk_kb "$m")
+        m_kb=$(_ymlx_disk_kb "$m" "$hub_dir" "$size_cache_file")
         model_kb[$m]=$m_kb
         (( total_kb += m_kb ))
       done
@@ -1658,7 +1537,7 @@ PY
         elif gum confirm "Remove $selected from $hub_dir?"; then
           rm -rf "$folder"
           unset "_ymlx_size_mt[$selected]" "_ymlx_size_kb[$selected]"
-          _ymlx_size_save
+          _ymlx_size_save "$size_cache_file"
           echo "Removed: $selected"
         fi
         ;;
