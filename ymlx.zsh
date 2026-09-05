@@ -18,14 +18,13 @@ ymlx() {
   local size_cache_file="$state_dir/sizes.tsv"
   local log_dir="$state_dir/logs"
   local config_file="$state_dir/config.zsh"
-  local last_model_file="$state_dir/last.txt"
   local chat_dir="$state_dir/chats"
 
   typeset -ga YMLX_CHAT_FLAGS=( --max-tokens 2048 --temp 0.7 --top-p 0.9 )
   typeset -ga YMLX_SERVER_FLAGS=()
 
   local cmd missing=()
-  for cmd in gum curl uvx mlx_lm.server mlx_lm.chat mlx_lm.generate; do
+  for cmd in gum curl uvx mlx_lm.server; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   if (( ${#missing[@]} > 0 )); then
@@ -49,18 +48,17 @@ ymlx() {
 
   _ymlx_write_default_config() {
     cat > "$1" <<'CFG'
-# ymlx config — sourced on startup. Use "Settings" in the main menu for the
+# ymlx config — sourced on startup. Use "Basic settings" in the main menu for the
 # common toggles (thinking / temp / max-tokens / system prompt); they live in
 # the managed block below and ymlx rewrites it. Hand-edit anything below the
 # block to add advanced flags — see `mlx_lm.chat --help` / `mlx_lm.server --help`.
-# --model / --port / --host are managed by ymlx (port auto-discovery 11500-11519).
+# --model / --port / --host are managed by ymlx (pinned to :11500).
 
-# >>> ymlx-managed quick settings — edit via "Settings" (expert mode via Advanced settings) <<<
+# >>> ymlx-managed quick settings — edit via "Basic settings" <<<
 YMLX_QUICK_THINKING="default"      # default | on | off  (default = use model's built-in)
 YMLX_QUICK_TEMP=""                 # e.g. 0.7, or empty to use YMLX_CHAT_FLAGS default
 YMLX_QUICK_MAX_TOKENS=""           # e.g. 2048, or empty to use YMLX_CHAT_FLAGS default
 YMLX_QUICK_SYSTEM_PROMPT=""        # chat only; empty disables
-YMLX_QUICK_EXPERT="off"            # off | on  (on exposes raw mlx_lm.* commands in menus)
 # <<< end ymlx-managed >>>
 
 YMLX_CHAT_FLAGS=(
@@ -107,11 +105,9 @@ CFG
   typeset -g YMLX_QUICK_TEMP=""
   typeset -g YMLX_QUICK_MAX_TOKENS=""
   typeset -g YMLX_QUICK_SYSTEM_PROMPT=""
-  typeset -g YMLX_QUICK_EXPERT="off"
   typeset -g _YMLX_TMP_CFG=""
   typeset -g _YMLX_STTY_SAVED=""
   typeset -g _YMLX_MENU_QUIT=0
-  typeset -g _YMLX_MENU_EXPERT=0
   typeset -g _YMLX_MENU_KEY=""
   typeset -ga _YMLX_MENU_LINES=()
   typeset -ga _YMLX_MENU_KINDS=()
@@ -170,41 +166,51 @@ CFG
     echo "  Base URL:   http://localhost:$port/v1"
     echo "  Model:      $model"
     echo "  Commands:   /reset clears history • /exit or Ctrl-D to leave"
-    echo "  Thinking:   $thinking • tab toggle thinking"
+    echo "  Thinking:   $thinking • tab toggle thinking • esc stops output"
     echo
-    python3 -c "$(cat <<'PY'
-import sys, json, re, signal, urllib.request, urllib.error
+python3 -c "$(cat <<'PY'
+import sys, json, re, signal, termios, tty, select, os, urllib.request, urllib.error
 
 url, model = sys.argv[1], sys.argv[2]
 sysp = sys.argv[3] if len(sys.argv) > 3 else ""
 thinking = sys.argv[4] if len(sys.argv) > 4 else "default"
 log_path = sys.argv[5] if len(sys.argv) > 5 else ""
 
-strip_think = (thinking == "off")
+# thinking: "default" | "on" | "off". enable_thinking is the per-request
+# override sent as chat_template_kwargs; None = leave it to the server flags.
+if thinking == "on":
+    enable_thinking = True
+elif thinking == "off":
+    enable_thinking = False
+else:
+    enable_thinking = None
+
 base = ([{"role":"system","content":sysp}] if sysp else [])
 messages = list(base)
 
-OPEN = re.compile(r'<think>|\[THINK\]', re.IGNORECASE)
-CLOSE = re.compile(r'</think>|\[/THINK\]', re.IGNORECASE)
+OPEN = re.compile(r' thinking|\[THINK\]', re.IGNORECASE)
+CLOSE = re.compile(r' response|\[/THINK\]', re.IGNORECASE)
 TAIL = 10  # max bytes to hold back in case a tag straddles chunks
+GRAY = "\033[2m"
+RESET = "\033[0m"
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
 class Filter:
-    def __init__(self, on):
-        self.on = on
+    # mode "show" renders thinking dim/gray; mode "strip" drops it entirely.
+    def __init__(self, mode):
+        self.mode = mode
         self.in_think = False
         self.buf = ""
     def feed(self, text):
-        if not self.on:
-            return text
         self.buf += text
         out = []
         while True:
             if self.in_think:
                 m = CLOSE.search(self.buf)
                 if not m:
-                    if len(self.buf) > TAIL:
-                        self.buf = self.buf[-TAIL:]
                     break
+                if self.mode == "show":
+                    out.append(GRAY + self.buf[:m.start()] + RESET)
                 self.buf = self.buf[m.end():]
                 self.in_think = False
             else:
@@ -220,14 +226,15 @@ class Filter:
                     break
         return "".join(out)
     def flush(self):
-        if not self.on or self.in_think:
+        if self.in_think:
+            out = (GRAY + self.buf + RESET) if self.mode == "show" else ""
             self.buf = ""
             self.in_think = False
-            return ""
+            return out
         rest, self.buf = self.buf, ""
         return rest
 
-flt = Filter(strip_think)
+flt = Filter("strip" if enable_thinking is False else "show")
 PROMPT = "\033[1;36myou>\033[0m "
 
 def log(msg):
@@ -238,25 +245,109 @@ def log(msg):
         except OSError:
             pass
 
-def toggle_thinking(signum, frame):
-    global strip_think, thinking
-    strip_think = not strip_think
-    flt.on = strip_think
-    thinking = "off" if strip_think else "on"
-    sys.stdout.write("\r\033[2m(thinking %s)\033[0m\r\n" % thinking)
+def toggle_thinking():
+    global enable_thinking
+    if enable_thinking is None:
+        enable_thinking = True
+    else:
+        enable_thinking = not enable_thinking
+    flt.mode = "show" if enable_thinking else "strip"
+    state = "on" if enable_thinking else "off"
+    sys.stdout.write("\r\033[2m(thinking %s)\033[0m\r\n" % state)
     sys.stdout.flush()
 
+# Ctrl-T (SIGINFO) also toggles thinking when the terminal delivers it.
 try:
-    signal.signal(signal.SIGINFO, toggle_thinking)
+    signal.signal(signal.SIGINFO, lambda s, f: toggle_thinking())
 except Exception:
     pass
 
+# Raw-mode terminal so we can see Tab and Esc as bytes instead of cooked input.
+FD = 0
+IN = ""  # leftover type-ahead / partially read input
+
+def key_available(timeout=0.0):
+    return bool(select.select([FD], [], [], timeout)[0])
+
+def fill(timeout=None):
+    global IN
+    if IN:
+        return True
+    if not key_available(timeout):
+        return False
+    IN = os.read(FD, 32).decode("utf-8", "replace")
+    return bool(IN)
+
+def next_byte(timeout=None):
+    global IN
+    if not fill(timeout):
+        return ""
+    b = IN[0]
+    IN = IN[1:]
+    return b
+
+def peek_byte(timeout=0.05):
+    if fill(timeout):
+        return IN[0]
+    return ""
+
+def input_line():
+    global IN
+    buf = ""
+    sys.stdout.write(PROMPT)
+    sys.stdout.flush()
+    while True:
+        b = next_byte(None)
+        if b == "\x1b":
+            nxt = peek_byte(0.05)
+            if nxt in ("[", "O"):
+                next_byte(0.05)  # consume the sequence introducer
+                while True:
+                    nb = peek_byte(0.05)
+                    if not nb:
+                        break
+                    next_byte(0.05)
+                    if 0x40 <= ord(nb) <= 0x7E:
+                        break
+            continue  # lone Esc is ignored without eating the next key
+        if b in ("\r", "\n"):
+            sys.stdout.write("\r\n")
+            sys.stdout.flush()
+            return buf
+        if b == "\x03":
+            sys.stdout.write("\r\n")
+            sys.stdout.flush()
+            raise KeyboardInterrupt
+        if b == "\x04":
+            sys.stdout.write("\r\n")
+            sys.stdout.flush()
+            raise EOFError
+        if b in ("\x7f", "\x08"):
+            if buf:
+                buf = buf[:-1]
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+        if b == "\t":
+            toggle_thinking()
+            sys.stdout.write(PROMPT + buf)
+            sys.stdout.flush()
+            continue
+        buf += b
+        sys.stdout.write(b)
+        sys.stdout.flush()
+
+old_term = termios.tcgetattr(FD)
 try:
+    tty.setraw(FD)
     while True:
         try:
-            user = input(PROMPT)
+            user = input_line()
         except EOFError:
-            print()
+            sys.stdout.write("\r\n")
+            break
+        except KeyboardInterrupt:
+            sys.stdout.write("\r\n")
             break
         s = user.strip()
         if not s:
@@ -265,19 +356,29 @@ try:
             break
         if s == "/reset":
             messages = list(base)
-            print("\033[2m(history cleared)\033[0m")
+            sys.stdout.write("\r\n\033[2m(history cleared)\033[0m\r\n")
+            sys.stdout.flush()
             log("(history cleared)")
             continue
         messages.append({"role":"user","content":user})
         log("you> " + user)
-        body = json.dumps({"model":model,"messages":messages,"stream":True}).encode()
-        req = urllib.request.Request(url, data=body, headers={"Content-Type":"application/json"})
+        body = {"model":model, "messages":messages, "stream":True}
+        if enable_thinking is not None:
+            body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type":"application/json"})
         print("\033[1;35massistant>\033[0m ", end="", flush=True)
         full = ""
         visible = ""
+        stopped = False
         try:
             with urllib.request.urlopen(req) as r:
                 for raw in r:
+                    if key_available(0):
+                        k = os.read(FD, 4096).decode("utf-8", "replace")
+                        if "\x1b" in k:
+                            stopped = True
+                            break
+                        IN = k + IN
                     line = raw.decode("utf-8", "replace").strip()
                     if not line.startswith("data:"):
                         continue
@@ -292,28 +393,40 @@ try:
                             shown = flt.feed(delta)
                             if shown:
                                 visible += shown
-                                print(shown, end="", flush=True)
+                                sys.stdout.write(shown.replace("\n", "\r\n"))
+                                sys.stdout.flush()
                     except (json.JSONDecodeError, KeyError, IndexError):
                         pass
-            tail = flt.flush()
-            if tail:
-                visible += tail
-                print(tail, end="", flush=True)
+            if not stopped:
+                tail = flt.flush()
+                if tail:
+                    visible += tail
+                    sys.stdout.write(tail.replace("\n", "\r\n"))
+                    sys.stdout.flush()
         except urllib.error.URLError as e:
-            print("\n\033[31m[error] %s\033[0m" % e)
+            sys.stdout.write("\r\n\033[31m[error] %s\033[0m\r\n" % e)
+            sys.stdout.flush()
             messages.pop()
             continue
         except KeyboardInterrupt:
-            print("\n\033[2m[interrupted]\033[0m")
+            sys.stdout.write("\r\n\033[2m[interrupted]\033[0m\r\n")
+            sys.stdout.flush()
             messages.pop()
             continue
-        print()
-        # Keep full (with thinking) in history so the model has context;
-        # only display is filtered.
+        sys.stdout.write("\r\n")
+        sys.stdout.flush()
+        # Esc keeps the partial reply in history so the model has context of
+        # what it already generated; only display is filtered.
+        plain = ANSI.sub("", visible)
+        if stopped:
+            sys.stdout.write("\033[2m[stopped]\033[0m\r\n")
+            sys.stdout.flush()
+            log("assistant> " + plain + " [stopped]")
+        else:
+            log("assistant> " + plain)
         messages.append({"role":"assistant","content":full})
-        log("assistant> " + visible)
-except KeyboardInterrupt:
-    print()
+finally:
+    termios.tcsetattr(FD, termios.TCSANOW, old_term)
 
 PY
 )" "$url" "$model" "$sysp" "$thinking" "$chat_log"
@@ -352,12 +465,11 @@ PY
     {
       if (( ! has_block )); then
         printf '%s\n' \
-          '# >>> ymlx-managed quick settings — edit via "Settings" (expert mode via Advanced settings) <<<' \
+          '# >>> ymlx-managed quick settings — edit via "Basic settings" <<<' \
           "YMLX_QUICK_THINKING=${(qq)YMLX_QUICK_THINKING}" \
           "YMLX_QUICK_TEMP=${(qq)YMLX_QUICK_TEMP}" \
           "YMLX_QUICK_MAX_TOKENS=${(qq)YMLX_QUICK_MAX_TOKENS}" \
           "YMLX_QUICK_SYSTEM_PROMPT=${(qq)YMLX_QUICK_SYSTEM_PROMPT}" \
-          "YMLX_QUICK_EXPERT=${(qq)YMLX_QUICK_EXPERT}" \
           '# <<< end ymlx-managed >>>' \
           ''
       fi
@@ -366,12 +478,11 @@ PY
         if [[ "$line" == '# >>> ymlx-managed'* ]]; then
           in_block=1
           printf '%s\n' \
-            '# >>> ymlx-managed quick settings — edit via "Settings" (expert mode via Advanced settings) <<<' \
+            '# >>> ymlx-managed quick settings — edit via "Basic settings" <<<' \
             "YMLX_QUICK_THINKING=${(qq)YMLX_QUICK_THINKING}" \
             "YMLX_QUICK_TEMP=${(qq)YMLX_QUICK_TEMP}" \
             "YMLX_QUICK_MAX_TOKENS=${(qq)YMLX_QUICK_MAX_TOKENS}" \
             "YMLX_QUICK_SYSTEM_PROMPT=${(qq)YMLX_QUICK_SYSTEM_PROMPT}" \
-            "YMLX_QUICK_EXPERT=${(qq)YMLX_QUICK_EXPERT}" \
             '# <<< end ymlx-managed >>>'
           continue
         fi
@@ -391,7 +502,7 @@ PY
     _ymlx_apply_quick
   }
 
-  _ymlx_settings_menu() {
+  _ymlx_basic_settings_menu() {
     while true; do
       local cur_t="${YMLX_QUICK_THINKING:-default}"
       local cur_temp="${YMLX_QUICK_TEMP:-default}"
@@ -402,22 +513,15 @@ PY
       else
         cur_sys="(none)"
       fi
-      local cur_expert="${YMLX_QUICK_EXPERT:-off}"
       local -a settings_entries=(
         "Thinking:       $cur_t"
         "Temperature:    $cur_temp"
         "Max tokens:     $cur_max"
         "System prompt:  $cur_sys"
-        "───────────────────────"
-        "Advanced settings"
-        "Open Local LLM Folder"
+        "Back"
       )
-      if [[ "$cur_expert" == "on" ]]; then
-        settings_entries+=( "Connect agentic CLI" "Turn off expert mode" )
-      fi
-      settings_entries+=("Back to Top")
-      local choice=$(printf "%s\n" "${settings_entries[@]}" | gum choose --header $'\nSettings (current values shown):' --height 14)
-      [[ -z "$choice" || "$choice" == "Back to Top" ]] && return
+      local choice=$(printf "%s\n" "${settings_entries[@]}" | gum choose --header $'\nBasic settings (current values shown):' --height 14)
+      [[ -z "$choice" || "$choice" == "Back" ]] && return
       case "$choice" in
         "Thinking:"*)
           local pick=$(printf "default\non\noff" | gum choose --header "Enable thinking?")
@@ -452,60 +556,54 @@ PY
             Clear) YMLX_QUICK_SYSTEM_PROMPT="" ;;
           esac
           ;;
-        "Advanced settings"*)
-          local ed=$(_ymlx_pick_editor)
-          eval "$ed \"\$config_file\""
-          _ymlx_reload_config
-          continue
-          ;;
-        "Connect agentic CLI"*)
-          echo
-          gum style --foreground 212 --bold "ymlx — one URL for every agentic CLI"
-          echo "  Base URL:  http://127.0.0.1:11500/v1/  (ymlx pins the active model to :11500)"
-          echo "  Auth:      none required — pass any string if your client demands one"
-          echo
-          gum style --foreground 244 "  # crush (~/.config/crush/crush.json):"
-          gum style --foreground 244 "  #   providers.ymlx.base_url = http://localhost:11500/v1/"
-          gum style --foreground 244 "  #   providers.ymlx.type     = openai-compat"
-          gum style --foreground 244 "  #   crush requires models[] declared explicitly."
-          gum style --foreground 244 "  # aider:        aider --openai-api-base http://localhost:11500/v1 --openai-api-key dummy"
-          gum style --foreground 244 "  # OpenAI SDK:   OpenAI(base_url='http://localhost:11500/v1', api_key='-')"
-          echo
-          if [[ -f ~/.config/crush/crush.json ]] && gum confirm "Sync ~/.config/crush/crush.json with installed models?"; then
-            _ymlx_sync_crush
-          fi
-          gum input --placeholder "(press enter to continue)" >/dev/null
-          ;;
-        "Turn off expert mode")
-          YMLX_QUICK_EXPERT="off"
-          ;;
-        "Open Local LLM Folder")
-          open "$hub_dir"
-          ;;
       esac
       _ymlx_write_managed_block "$config_file"
       _ymlx_reload_config
     done
   }
 
+  _ymlx_advanced_settings_menu() {
+    local ed=$(_ymlx_pick_editor)
+    eval "$ed \"\$config_file\""
+    _ymlx_reload_config
+  }
+
+  _ymlx_open_models_folder() {
+    open "$hub_dir"
+  }
+
+  _ymlx_main_restart() {
+    _ymlx_main_clear
+    local pid port model running_model=""
+    while IFS=$'\t' read -r pid port model; do
+      [[ -n "$pid" ]] && running_model="$model"
+    done < <(_ymlx_running)
+    if [[ -n "$running_model" ]]; then
+      _ymlx_stop_all >/dev/null 2>&1
+      echo "Restarting: $running_model"
+      _ymlx_launch "$running_model"
+    else
+      echo "No model is running — nothing to restart."
+      echo "(Menu refreshed.)"
+    fi
+  }
+
   [[ -f "$config_file" ]] || _ymlx_write_default_config "$config_file"
   _ymlx_reload_config
 
-  # Discover currently running mlx_lm.server processes on our port range by
-  # asking the OS, not a state file. Emits TSV lines: pid<TAB>port<TAB>model.
-  # The model id is parsed from the process's --model arg.
-  _ymlx_running() {
-    local p lpid cmd m
-    for p in {11500..11519}; do
-      lpid=$(lsof -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null | head -n1)
-      [[ -z "$lpid" ]] && continue
-      cmd=$(ps -o command= -p "$lpid" 2>/dev/null)
-      [[ "$cmd" != *"--model "* ]] && continue
-      m="${cmd#*--model }"
-      m="${m%% *}"
-      [[ -z "$m" ]] && continue
-      printf '%s\t%s\t%s\n' "$lpid" "$p" "$m"
-    done
+# Discover the currently running mlx_lm.server on :11500 by asking the OS, not
+# a state file. Emits a TSV line: pid<TAB>port<TAB>model.
+# The model id is parsed from the process's --model arg.
+_ymlx_running() {
+    local lpid cmd m
+    lpid=$(lsof -iTCP:11500 -sTCP:LISTEN -t 2>/dev/null | head -n1)
+    [[ -z "$lpid" ]] && return
+    cmd=$(ps -o command= -p "$lpid" 2>/dev/null)
+    [[ "$cmd" != *"--model "* ]] && return
+    m="${cmd#*--model }"
+    m="${m%% *}"
+    [[ -z "$m" ]] && return
+    printf '%s\t%s\t%s\n' "$lpid" 11500 "$m"
   }
 
   # Remove a pid from the session-tracked list (called after we kill it, so
@@ -528,55 +626,13 @@ PY
     _YMLX_SESSION_PIDS=()
   }
 
-  # Update ~/.config/crush/crush.json's `ymlx` provider models[] from the
-  # installed hub. Crush requires every usable model to be listed explicitly —
-  # it does not auto-discover from /v1/models. Preserves everything else in
-  # crush.json.
-  _ymlx_sync_crush() {
-    local cf=~/.config/crush/crush.json
-    [[ -f "$cf" ]] || { echo "crush.json not found at $cf — nothing to sync."; return 1; }
-    command -v python3 >/dev/null 2>&1 || { echo "python3 required for sync."; return 1; }
-    local models_csv=""
-    local m
-    for m in $(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g'); do
-      models_csv+="$m"$'\n'
-    done
-    YMLX_CRUSH_MODELS="$models_csv" python3 - "$cf" <<'PY'
-import json, os, sys
-cf = sys.argv[1]
-with open(cf) as f:
-    cfg = json.load(f)
-ids = [x for x in os.environ.get("YMLX_CRUSH_MODELS","").splitlines() if x.strip()]
-def short(mid):
-    base = mid.split("/", 1)[-1]
-    return base.replace("-MLX", "").replace("-4bit", "").replace("--", "-").strip("-")
-prov = cfg.setdefault("providers", {}).setdefault("ymlx", {})
-prov["name"] = prov.get("name", "ymlx (local MLX)")
-prov["base_url"] = "http://localhost:11500/v1/"
-prov["type"] = "openai-compat"
-prov.setdefault("api_key", "dummy")
-prov["models"] = [
-    {"id": mid, "name": short(mid), "context_window": 32768, "default_max_tokens": 8192}
-    for mid in ids
-]
-with open(cf, "w") as f:
-    json.dump(cfg, f, indent=2)
-    f.write("\n")
-print(f"Synced {len(ids)} model(s) into {cf}")
-PY
-  }
-
   _ymlx_size_load "$size_cache_file"
 
   _ymlx_launch() {
     local model="$1"
     local port=$(_ymlx_find_port)
     if [[ -z "$port" ]]; then
-      if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
-        echo "No free port in 11500-11519."
-      else
-        echo "Port :11500 is busy. Stop the running model (^s in the menu) first."
-      fi
+      echo "Port :11500 is busy. Stop the running model (^s in the menu) first."
       return 1
     fi
     local safe="${model//\//_}"
@@ -618,7 +674,6 @@ PY
       (( rc == 0 )) && echo "  ✓ Server ready"
     fi
     if (( rc == 0 )); then
-      print -r -- "$model" > "$last_model_file"
       echo "Started: $model on :$port (pid $pid)"
       echo "Logs: $log"
       echo
@@ -636,6 +691,7 @@ PY
       echo "Failed to start $model. Last log lines:"
       tail -n 20 "$log"
     fi
+    return $rc
   }
 
   _ymlx_download_menu() {
@@ -748,7 +804,6 @@ PY
       echo
       if gum confirm "Start $model now?"; then
         _ymlx_launch "$model"
-        _preselect_model="$model"
       fi
     else
       echo
@@ -811,11 +866,11 @@ PY
     models=$(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
     if [[ -z "$models" ]]; then
       _YMLX_MENU_NO_MODELS=1
-      _YMLX_MENU_LINES=( "Download your first model" "Chat History" "Settings" "Quit" )
-      _YMLX_MENU_KINDS=( "action" "action" "action" "action" )
-      _YMLX_MENU_MODELS=( "" "" "" "" )
-      _YMLX_MENU_PORTS=( "" "" "" "" )
-      _YMLX_MENU_ACTIONS=( "download" "history" "settings" "quit" )
+      _YMLX_MENU_LINES=( "Download your first model" "Chat history" "Basic settings" "Advanced settings" "Open models folder" "Stop and quit" )
+      _YMLX_MENU_KINDS=( "action" "action" "action" "action" "action" "action" )
+      _YMLX_MENU_MODELS=( "" "" "" "" "" "" )
+      _YMLX_MENU_PORTS=( "" "" "" "" "" "" )
+      _YMLX_MENU_ACTIONS=( "download" "history" "basic" "advanced" "openhub" "quit" )
     else
       for m in ${(f)models}; do
         friendly=$(_ymlx_display_name "$m")
@@ -842,10 +897,11 @@ PY
       _YMLX_MENU_LINES+=( "──────────────────────" )
       _YMLX_MENU_KINDS+=( "separator" )
       _YMLX_MENU_MODELS+=( "" ); _YMLX_MENU_PORTS+=( "" ); _YMLX_MENU_ACTIONS+=( "" )
-      _YMLX_MENU_LINES+=( "Chat History" "Settings" "Download" "Quit" )
-      _YMLX_MENU_KINDS+=( "action" "action" "action" "action" )
-      _YMLX_MENU_MODELS+=( "" "" "" "" ); _YMLX_MENU_PORTS+=( "" "" "" "" )
-      _YMLX_MENU_ACTIONS+=( "history" "settings" "download" "quit" )
+      _YMLX_MENU_LINES+=( "Chat history" "Basic settings" "Advanced settings" "Open models folder" "Download new model" "Restart and refresh" "Stop and quit" )
+      _YMLX_MENU_KINDS+=( "action" "action" "action" "action" "action" "action" "action" )
+      _YMLX_MENU_MODELS+=( "" "" "" "" "" "" "" )
+      _YMLX_MENU_PORTS+=( "" "" "" "" "" "" "" )
+      _YMLX_MENU_ACTIONS+=( "history" "basic" "advanced" "openhub" "download" "restart" "quit" )
     fi
     _YMLX_MENU_SCROLL=0
     if (( first_running_idx >= 0 )); then
@@ -934,15 +990,16 @@ PY
   }
 
   _ymlx_main_move() {
-    local delta="$1" n=${#_YMLX_MENU_LINES[@]} new=$_YMLX_MENU_CURSOR
+    local delta="$1" n=${#_YMLX_MENU_LINES[@]} new=$_YMLX_MENU_CURSOR guard=$_YMLX_MENU_CURSOR
     while true; do
       new=$(( new + delta ))
-      if (( new < 0 )); then return; fi
-      if (( new >= n )); then return; fi
+      if (( new < 0 )); then new=$(( n - 1 )); fi
+      if (( new >= n )); then new=0; fi
       if [[ "${_YMLX_MENU_KINDS[$((new+1))]}" != "separator" ]]; then
         _YMLX_MENU_CURSOR=$new
         break
       fi
+      if (( new == guard )); then break; fi
     done
     _ymlx_main_scroll_cursor
   }
@@ -1086,23 +1143,23 @@ PY
           echo "Stop it with ^s, then try again."
           gum input --placeholder "(press enter to continue)" >/dev/null
         else
-          _ymlx_launch "$model"
-          _preselect_model="$model"
+          if _ymlx_launch "$model"; then
+            _ymlx_chat_repl "$model" "11500"
+          fi
         fi
       fi
     else
       case "$action" in
         download) _ymlx_download_menu ;;
         history) _ymlx_chat_history_menu ;;
-        settings) _ymlx_settings_menu ;;
+        basic) _ymlx_basic_settings_menu ;;
+        advanced) _ymlx_advanced_settings_menu ;;
+        openhub) _ymlx_open_models_folder ;;
+        restart) _ymlx_main_restart ;;
         quit) _ymlx_main_quit ;;
       esac
     fi
     (( _YMLX_MENU_QUIT )) && return
-    if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
-      _YMLX_MENU_EXPERT=1
-      return
-    fi
     _ymlx_main_rebuild_full
   }
 
@@ -1139,7 +1196,6 @@ PY
     (( _YMLX_MENU_WIDTH < 40 )) && _YMLX_MENU_WIDTH=80
     (( _YMLX_MENU_VIS < 1 )) && _YMLX_MENU_VIS=1
     _YMLX_MENU_QUIT=0
-    _YMLX_MENU_EXPERT=0
     _YMLX_MENU_DRAWN=0
     _YMLX_MENU_NLINES=0
     stty -ixon 2>/dev/null
@@ -1162,7 +1218,6 @@ PY
       elif [[ "$key" == $'\n' || "$key" == $'\r' ]]; then
         _ymlx_main_activate
         (( _YMLX_MENU_QUIT )) && break
-        (( _YMLX_MENU_EXPERT )) && return 0
       elif [[ "$key" == $'\t' ]]; then
         _ymlx_main_toggle_thinking
       elif [[ "$key" == $'\x13' ]]; then
@@ -1177,373 +1232,14 @@ PY
     done
   }
 
-  local models selected
-  local _preselect_model=""
-  [[ -f "$last_model_file" ]] && _preselect_model="$(<"$last_model_file")"
-
   clear
   echo
   gum style --foreground 212 --bold "▌▌ YMLX"
   gum style --foreground 244 "Runs an MLX model behind an OpenAI-compatible REST API at localhost:11500"
 
   while true; do
-    if [[ "$YMLX_QUICK_EXPERT" != "on" ]]; then
-      _ymlx_main_standard
-      (( _YMLX_MENU_QUIT )) && return
-      continue
-    fi
-
-    models=$(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
-
-    local main_entries=() pid="" port="" model="" display="" rss_h="" _preselect_display=""
-    typeset -A active_pid active_port active_model installed_model running_for_model
-    active_pid=() active_port=() active_model=() installed_model=() running_for_model=()
-    while IFS=$'\t' read -r pid port model; do
-      [[ -z "$pid" ]] && continue
-      running_for_model[$model]="$pid"$'\t'"$port"
-    done < <(_ymlx_running)
-
-    local total_kb=0 m="" m_kb=0
-    typeset -A model_kb
-    if [[ -n "$models" ]]; then
-      for m in ${(f)models}; do
-        m_kb=$(_ymlx_disk_kb "$m" "$hub_dir" "$size_cache_file")
-        model_kb[$m]=$m_kb
-        (( total_kb += m_kb ))
-      done
-      local _label=""
-      for m in ${(f)models}; do
-        _label=$(_ymlx_friendly_name "$m")
-        if [[ -n "${running_for_model[$m]}" ]]; then
-          local _rp="${running_for_model[$m]%%	*}" _rport="${running_for_model[$m]##*	}"
-          rss_h=$(_ymlx_rss_h "$_rp")
-          display="● $_label  :$_rport  $rss_h  ($(_ymlx_format_size ${model_kb[$m]}))"
-          active_pid[$display]="$_rp"
-          active_port[$display]="$_rport"
-          active_model[$display]="$m"
-        else
-          display="$_label  ($(_ymlx_format_size ${model_kb[$m]}))"
-          installed_model[$display]="$m"
-        fi
-        main_entries+=("$display")
-        [[ -n "$_preselect_model" && "$m" == "$_preselect_model" ]] && _preselect_display="$display"
-      done
-    fi
-    local _no_models=0
-    if (( ${#main_entries[@]} == 0 )); then
-      _no_models=1
-      main_entries=( "Download your first model" "Settings" "Quit" )
-    else
-      main_entries+=("──────────────────────" "Settings" "Download")
-      [[ "$YMLX_DEBUG" == true ]] && main_entries+=("Debug: ports 11500-11519")
-      [[ "$YMLX_QUICK_EXPERT" == "on" ]] && main_entries+=("Stop All")
-      main_entries+=("Quit")
-    fi
-
-    local _dim_on=$'\e[2m' _dim_off=$'\e[0m'
-    local _hdr=$'\n'
-    if (( _no_models )); then
-      _hdr+="No models installed yet."
-    else
-      _hdr+="Select model:"
-      if (( total_kb > 0 )); then
-        _hdr+=$'\n'"${_dim_on}$(_ymlx_format_size $total_kb) installed total${_dim_off}"
-      fi
-    fi
-    local -a _gum_args=( --header "$_hdr" --height 30 )
-    [[ -n "$_preselect_display" ]] && _gum_args+=( --selected "$_preselect_display" )
-    selected=$(printf "%s\n" "${main_entries[@]}" | gum choose "${_gum_args[@]}")
-    _preselect_model=""
-    [[ -z "$selected" ]] && continue
-
-    if [[ "$selected" == *───* ]]; then
-      continue
-    elif [[ "$selected" == "Download your first model" ]]; then
-      selected="Download"
-    fi
-    if [[ "$selected" == "Stop All" ]]; then
-      _ymlx_stop_all
-      continue
-    elif [[ "$selected" == "Quit" ]]; then
-      gum confirm "Quit ymlx and stop all running models?" || continue
-      _ymlx_stop_all >/dev/null 2>&1
-      return
-    elif [[ -n "${active_pid[$selected]}" ]]; then
-      local a_pid="${active_pid[$selected]}"
-      local a_port="${active_port[$selected]}"
-      local a_model="${active_model[$selected]}"
-      local _stay_in_submenu=1
-      while (( _stay_in_submenu )); do
-      _stay_in_submenu=0
-      local action
-      if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
-        action=$(printf "Chat via mlx_lm.server\nServer details\nStop server\nRestart\nAdjust settings\nCopy name\nTail logs\nBack" | gum choose --header $'\n'"$a_model running on :$a_port (pid $a_pid)" --height 12)
-      else
-        action=$(printf "Chat\nUse from another app\nAdjust settings\nStop\nBack" | gum choose --header $'\n'"$a_model running on :$a_port (pid $a_pid)" --height 10)
-      fi
-      [[ -z "$action" ]] && break
-      case "$action" in
-        "Adjust settings")
-          local tmp_cfg=$(mktemp -t ymlx_cfg.XXXXXX)
-          _YMLX_TMP_CFG="$tmp_cfg"
-          cp "$config_file" "$tmp_cfg"
-          local _bk_t="$YMLX_QUICK_THINKING" _bk_temp="$YMLX_QUICK_TEMP"
-          local _bk_max="$YMLX_QUICK_MAX_TOKENS" _bk_sys="$YMLX_QUICK_SYSTEM_PROMPT"
-          local -a _bk_chat=( "${YMLX_CHAT_FLAGS[@]}" )
-          local -a _bk_srv=( "${YMLX_SERVER_FLAGS[@]}" )
-          local action_done=""
-          while [[ -z "$action_done" ]]; do
-            local cur_t="${YMLX_QUICK_THINKING:-default}"
-            local cur_temp="${YMLX_QUICK_TEMP:-default}"
-            local cur_max="${YMLX_QUICK_MAX_TOKENS:-default}"
-            local cur_sys
-            if [[ -n "$YMLX_QUICK_SYSTEM_PROMPT" ]]; then
-              cur_sys="(${#YMLX_QUICK_SYSTEM_PROMPT} chars)"
-            else
-              cur_sys="(none)"
-            fi
-            local -a _adj_entries=(
-              "Thinking:       $cur_t"
-              "Temperature:    $cur_temp"
-              "Max tokens:     $cur_max"
-              "System prompt:  $cur_sys"
-              "──────────────"
-            )
-            [[ "$YMLX_QUICK_EXPERT" == "on" ]] && _adj_entries+=( "Advanced settings" )
-            _adj_entries+=( "Discard changes" "Restart" )
-            local sub=$(printf "%s\n" "${_adj_entries[@]}" | gum choose --header $'\nAdjust settings for '"$a_model"$' (this server only)' --height 14)
-            case "$sub" in
-              "Thinking:"*)
-                local pick=$(printf "default\non\noff" | gum choose --header "Enable thinking?")
-                [[ -n "$pick" ]] && YMLX_QUICK_THINKING="$pick"
-                ;;
-              "Temperature:"*)
-                local pick=$(printf "default\n0.0\n0.3\n0.7\n1.0\nCustom…" | gum choose --header "Temperature")
-                case "$pick" in
-                  default) YMLX_QUICK_TEMP="" ;;
-                  "Custom…") YMLX_QUICK_TEMP=$(gum input --placeholder "e.g. 0.5" --value "$YMLX_QUICK_TEMP") ;;
-                  "") ;;
-                  *) YMLX_QUICK_TEMP="$pick" ;;
-                esac
-                ;;
-              "Max tokens:"*)
-                local pick=$(printf "default\n512\n2048\n8192\n32768\nCustom…" | gum choose --header "Max tokens")
-                case "$pick" in
-                  default) YMLX_QUICK_MAX_TOKENS="" ;;
-                  "Custom…") YMLX_QUICK_MAX_TOKENS=$(gum input --placeholder "e.g. 4096" --value "$YMLX_QUICK_MAX_TOKENS") ;;
-                  "") ;;
-                  *) YMLX_QUICK_MAX_TOKENS="$pick" ;;
-                esac
-                ;;
-              "System prompt:"*)
-                local sub2=$(printf "Edit\nClear\nCancel" | gum choose --header "System prompt")
-                case "$sub2" in
-                  Edit)
-                    local new
-                    new=$(gum write --placeholder "Type system prompt — Ctrl-D to save, Esc to cancel" --value "$YMLX_QUICK_SYSTEM_PROMPT" --width 80 --height 12)
-                    [[ $? -eq 0 && -n "$new" ]] && YMLX_QUICK_SYSTEM_PROMPT="$new"
-                    ;;
-                  Clear) YMLX_QUICK_SYSTEM_PROMPT="" ;;
-                esac
-                ;;
-              "Advanced settings"*)
-                local ed=$(_ymlx_pick_editor)
-                eval "$ed \"\$tmp_cfg\""
-                source "$tmp_cfg"
-                continue
-                ;;
-              "Restart")
-                action_done="restart"
-                break
-                ;;
-              *)
-                action_done="discard"
-                break
-                ;;
-            esac
-            _ymlx_write_managed_block "$tmp_cfg"
-            source "$tmp_cfg"
-          done
-          if [[ "$action_done" == "restart" ]]; then
-            _ymlx_apply_quick
-            kill "$a_pid" 2>/dev/null
-            _ymlx_drop "$a_pid"
-            _ymlx_launch "$a_model"
-          fi
-          YMLX_QUICK_THINKING="$_bk_t"
-          YMLX_QUICK_TEMP="$_bk_temp"
-          YMLX_QUICK_MAX_TOKENS="$_bk_max"
-          YMLX_QUICK_SYSTEM_PROMPT="$_bk_sys"
-          YMLX_CHAT_FLAGS=( "${_bk_chat[@]}" )
-          YMLX_SERVER_FLAGS=( "${_bk_srv[@]}" )
-          _ymlx_reload_config
-          rm -f "$tmp_cfg"
-          _YMLX_TMP_CFG=""
-          if [[ "$action_done" == "restart" ]]; then
-            local _np="" _npt="" _p _pt _m
-            while IFS=$'\t' read -r _p _pt _m; do
-              [[ "$_m" == "$a_model" ]] && { _np="$_p"; _npt="$_pt"; break; }
-            done < <(_ymlx_running)
-            if [[ -n "$_np" ]]; then
-              a_pid="$_np"; a_port="$_npt"
-              _stay_in_submenu=1
-            fi
-          else
-            _stay_in_submenu=1
-          fi
-          ;;
-        "Chat"|"Chat via mlx_lm.server")
-          _ymlx_chat_repl "$a_model" "$a_port"
-          ;;
-        "Server details"|"Use from another app")
-          _ymlx_talk_info "$a_model" "$a_port"
-          gum input --placeholder "(press enter to continue)" >/dev/null
-          _stay_in_submenu=1
-          ;;
-        "Tail logs")
-          local safe="${a_model//\//_}"
-          local log="$log_dir/${safe}-${a_port}.log"
-          if [[ -f "$log" ]]; then
-            local ed=$(_ymlx_pick_editor)
-            eval "$ed \"\$log\""
-          else
-            echo "Log not found: $log"
-          fi
-          ;;
-        "Restart")
-          if kill "$a_pid" 2>/dev/null; then
-            echo "Stopped: $a_model on :$a_port (pid $a_pid)"
-          fi
-          _ymlx_drop "$a_pid"
-          _ymlx_launch "$a_model"
-          _preselect_model="$a_model"
-          ;;
-        "Stop"|"Stop server")
-          if kill "$a_pid" 2>/dev/null; then
-            echo "Stopped: $a_model on :$a_port (pid $a_pid)"
-          else
-            echo "Process $a_pid was already gone."
-          fi
-          _ymlx_drop "$a_pid"
-          ;;
-        "Copy name")
-          echo "$a_model" | pbcopy
-          echo "Copied: $a_model"
-          ;;
-      esac
-      done
-      continue
-    elif [[ "$selected" == "Settings" ]]; then
-      _ymlx_settings_menu
-      continue
-    elif [[ "$selected" == "Debug: ports 11500-11519" ]]; then
-      echo "lsof -i :11500-11519"
-      echo
-      lsof -iTCP:11500-11519 -sTCP:LISTEN -P -n 2>/dev/null || echo "(no listeners)"
-      echo
-      gum input --placeholder "(press enter to continue)" >/dev/null
-      continue
-    elif [[ "$selected" == "Download" ]]; then
-      _ymlx_download_menu
-      continue
-    fi
-
-    [[ -n "${installed_model[$selected]}" ]] && selected="${installed_model[$selected]}"
-
-    local action
-    local _occupant_pid="" _occupant_model="" _p _pt _m
-    while IFS=$'\t' read -r _p _pt _m; do
-      if [[ "$_pt" == "11500" ]]; then
-        _occupant_pid="$_p"; _occupant_model="$_m"
-        break
-      fi
-    done < <(_ymlx_running)
-
-    # Lowest free port in [11501, 11519] — for "Run new" in expert mode.
-    local _next_extra_port=""
-    local _try=11501
-    while (( _try <= 11519 )); do
-      if _ymlx_port_free "$_try"; then _next_extra_port="$_try"; break; fi
-      (( _try++ ))
-    done
-
-    if [[ "$YMLX_QUICK_EXPERT" == "on" ]]; then
-      local -a _xa=()
-      if [[ -z "$_occupant_pid" ]]; then
-        _xa+=( "Start mlx_lm.server on port 11500" )
-      elif [[ "$_occupant_model" != "$selected" ]]; then
-        _xa+=( "Swap mlx_lm.server on port 11500" )
-      fi
-      [[ -n "$_occupant_pid" && -n "$_next_extra_port" ]] && _xa+=( "Run mlx_lm.server on port $_next_extra_port" )
-      _xa+=( "Run mlx_lm.chat" "Run mlx_lm.generate" "Copy name" "Delete" "Back" )
-      action=$(printf "%s\n" "${_xa[@]}" | gum choose --header $'\n'"$selected:" --height 12)
-    else
-      local _std_first
-      if [[ "$_occupant_model" == "$selected" ]]; then
-        _std_first="Already running on :11500"
-      elif [[ -n "$_occupant_model" ]]; then
-        _std_first="Swap"
-      else
-        _std_first="Start"
-      fi
-      action=$(printf "%s\nDelete\nBack" "$_std_first" | gum choose --header $'\n'"$selected:" --height 8)
-    fi
-    [[ -z "$action" ]] && continue
-
-    case "$action" in
-      "Start"|"Start mlx_lm.server on port 11500")
-        _ymlx_launch "$selected"
-        _preselect_model="$selected"
-        ;;
-      "Swap"|"Swap mlx_lm.server on port 11500")
-        if [[ -n "$_occupant_pid" ]]; then
-          echo "Stopping $_occupant_model on :11500…"
-          kill "$_occupant_pid" 2>/dev/null
-          _ymlx_drop "$_occupant_pid"
-          local _wait=0
-          while (( _wait < 20 )) && ! _ymlx_port_free 11500; do
-            sleep 0.1; (( _wait++ ))
-          done
-        fi
-        _ymlx_launch "$selected"
-        _preselect_model="$selected"
-        ;;
-      "Run mlx_lm.server on port "*)
-        _ymlx_launch "$selected"
-        _preselect_model="$selected"
-        ;;
-      "Already running on :11500")
-        _preselect_model="$selected"
-        ;;
-      "Run mlx_lm.chat")
-        mlx_lm.chat --model "$selected" "${YMLX_CHAT_FLAGS[@]}"
-        ;;
-      "Run mlx_lm.generate")
-        local prompt
-        prompt=$(gum write --placeholder "Type a prompt — Ctrl-D to run, Esc to cancel" --width 80 --height 12)
-        if [[ $? -eq 0 && -n "$prompt" ]]; then
-          mlx_lm.generate --model "$selected" --prompt "$prompt"
-          gum input --placeholder "(press enter to continue)" >/dev/null
-        fi
-        ;;
-      "Copy name")
-        echo "$selected" | pbcopy
-        echo "Copied: $selected"
-        ;;
-      "Delete")
-        local folder="$hub_dir/models--${selected//\//--}"
-        if [[ ! -d "$folder" ]]; then
-          echo "Folder not found: $folder"
-        elif gum confirm "Remove $selected from $hub_dir?"; then
-          rm -rf "$folder"
-          unset "_ymlx_size_mt[$selected]" "_ymlx_size_kb[$selected]"
-          _ymlx_size_save "$size_cache_file"
-          echo "Removed: $selected"
-        fi
-        ;;
-      "Back")
-        ;;
-    esac
+    _ymlx_main_standard
+    (( _YMLX_MENU_QUIT )) && return
   done
 }
 
