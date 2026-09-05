@@ -15,23 +15,22 @@ ymlx() {
   local YMLX_DEBUG=false
   local hub_dir=~/.cache/huggingface/hub
   local state_dir=~/.cache/ymlx
-  local size_cache_file="$state_dir/sizes.tsv"
   local log_dir="$state_dir/logs"
   local config_file="$state_dir/config.zsh"
   local chat_dir="$state_dir/chats"
 
-  typeset -ga YMLX_CHAT_FLAGS=( --max-tokens 2048 --temp 0.7 --top-p 0.9 )
+  typeset -ga YMLX_CHAT_FLAGS=( --max-tokens 2048 --temperature 0.7 )
   typeset -ga YMLX_SERVER_FLAGS=()
 
   local cmd missing=()
-  for cmd in gum curl uvx mlx_lm.server; do
+  for cmd in gum curl uvx mlx_vlm.server; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   if (( ${#missing[@]} > 0 )); then
     print -u2 "ymlx: missing required tool(s): ${missing[*]}"
     print -u2 ""
     print -u2 "Install with:"
-    print -u2 "  brew install uv gum && uv tool install mlx-lm"
+    print -u2 "  brew install uv gum && uv tool install mlx-vlm --with jinja2"
     return 1
   fi
 
@@ -51,7 +50,7 @@ ymlx() {
 # ymlx config — sourced on startup. Use "Basic settings" in the main menu for the
 # common toggles (thinking / temp / max-tokens / system prompt); they live in
 # the managed block below and ymlx rewrites it. Hand-edit anything below the
-# block to add advanced flags — see `mlx_lm.chat --help` / `mlx_lm.server --help`.
+# block to add advanced flags — see `mlx_vlm.chat --help` / `mlx_vlm.server --help`.
 # --model / --port / --host are managed by ymlx (pinned to :11500).
 
 # >>> ymlx-managed quick settings — edit via "Basic settings" <<<
@@ -61,42 +60,43 @@ YMLX_QUICK_MAX_TOKENS=""           # e.g. 2048, or empty to use YMLX_CHAT_FLAGS 
 YMLX_QUICK_SYSTEM_PROMPT=""        # chat only; empty disables
 # <<< end ymlx-managed >>>
 
+# CHAT_FLAGS are informational: the built-in REPL talks to the running server
+# over HTTP, so the SERVER_FLAGS below are the ones that take effect at runtime.
 YMLX_CHAT_FLAGS=(
   --max-tokens 2048
-  --temp 0.7
-  --top-p 0.9
-  # --xtc-probability 0.0
-  # --xtc-threshold 0.1
-  # --seed 42
+  --temperature 0.7
+  # --enable-thinking
+  # --thinking-budget 100
+  # --thinking-mode enabled
   # --max-kv-size 4096
-  # --system-prompt "You are a helpful assistant."
-  # --chat-template-args '{"enable_thinking": true}'
-  # --trust-remote-code
-  # --adapter-path /path/to/adapter
-  # --pipeline
+  # --kv-bits 8
+  # --kv-quant-scheme turboquant
+  # --quantized-kv-start 2048
 )
 
 YMLX_SERVER_FLAGS=(
-  # --temp 0.7
-  # --top-p 0.9
-  # --top-k 40
-  # --min-p 0.05
   # --max-tokens 2048
+  # --enable-thinking      # Basic settings manages on/off; requests may override per-request
+  # --thinking-budget 100
+  # --thinking-start-token " thinking"
+  # --thinking-end-token " response"
   # --draft-model mlx-community/some-draft-model
-  # --num-draft-tokens 4
+  # --draft-kind dflash
+  # --max-num-seqs 1
+  # --kv-bits 8
+  # --kv-quant-scheme turboquant
+  # --max-kv-size 4096
+  # --quantized-kv-start 2048
+  # --prefill-step-size 2048
+  # --vision-cache-size 100
+  # --adapter-path /path/to/adapter
+  # --image-model mlx-community/some-image-model    # preload alongside the chat model
+  # --tts-model mlx-community/some-tts-model        # preload text-to-speech
+  # --stt-model mlx-community/some-stt-model        # preload speech-to-text
+  # --embedding-model mlx-community/some-embedder
+  # --reranker-model mlx-community/some-reranker
   # --trust-remote-code
   # --log-level INFO
-  # --chat-template ""
-  # --use-default-chat-template
-  # --chat-template-args '{"enable_thinking": true}'
-  # --decode-concurrency 1
-  # --prompt-concurrency 1
-  # --prefill-step-size 2048
-  # --prompt-cache-size 0
-  # --prompt-cache-bytes 0
-  # --pipeline
-  # --adapter-path /path/to/adapter
-  # --allowed-origins "*"
 )
 CFG
   }
@@ -108,6 +108,7 @@ CFG
   typeset -g _YMLX_TMP_CFG=""
   typeset -g _YMLX_STTY_SAVED=""
   typeset -g _YMLX_MENU_QUIT=0
+  typeset -gi _YMLX_HF_SKIPPED=0
   typeset -g _YMLX_MENU_KEY=""
   typeset -ga _YMLX_MENU_LINES=()
   typeset -ga _YMLX_MENU_KINDS=()
@@ -169,15 +170,18 @@ CFG
     echo "  Thinking:   $thinking • tab toggle thinking • esc stops output"
     echo
 python3 -c "$(cat <<'PY'
-import sys, json, re, signal, termios, tty, select, os, urllib.request, urllib.error
+import sys, json, re, signal, termios, tty, select, os, codecs, urllib.request, urllib.error
 
 url, model = sys.argv[1], sys.argv[2]
 sysp = sys.argv[3] if len(sys.argv) > 3 else ""
 thinking = sys.argv[4] if len(sys.argv) > 4 else "default"
 log_path = sys.argv[5] if len(sys.argv) > 5 else ""
+temp = sys.argv[6] if len(sys.argv) > 6 else ""
+max_tokens = sys.argv[7] if len(sys.argv) > 7 else ""
 
 # thinking: "default" | "on" | "off". enable_thinking is the per-request
-# override sent as chat_template_kwargs; None = leave it to the server flags.
+# override mlx_vlm.server reads as the top-level "enable_thinking" field;
+# None = leave it to the server default (--enable-thinking).
 if thinking == "on":
     enable_thinking = True
 elif thinking == "off":
@@ -194,6 +198,7 @@ TAIL = 10  # max bytes to hold back in case a tag straddles chunks
 GRAY = "\033[2m"
 RESET = "\033[0m"
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
+decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
 class Filter:
     # mode "show" renders thinking dim/gray; mode "strip" drops it entirely.
@@ -273,10 +278,21 @@ def fill(timeout=None):
     global IN
     if IN:
         return True
-    if not key_available(timeout):
-        return False
-    IN = os.read(FD, 32).decode("utf-8", "replace")
-    return bool(IN)
+    # Incremental decoder keeps a multibyte UTF-8 char intact even if a
+    # paste lands on a read() boundary (os.read(FD, 32) may split it).
+    while True:
+        if not key_available(timeout):
+            return False
+        raw = os.read(FD, 32)
+        if not raw:
+            return False  # EOF
+        IN = decoder.decode(raw)
+        if IN:
+            return True
+        # Decoded nothing yet (partial multibyte char). Keep reading only
+        # when blocking; for bounded peeks, report "nothing yet".
+        if timeout is not None:
+            return False
 
 def next_byte(timeout=None):
     global IN
@@ -298,6 +314,8 @@ def input_line():
     sys.stdout.flush()
     while True:
         b = next_byte(None)
+        if b == "":
+            raise EOFError
         if b == "\x1b":
             nxt = peek_byte(0.05)
             if nxt in ("[", "O"):
@@ -364,7 +382,17 @@ try:
         log("you> " + user)
         body = {"model":model, "messages":messages, "stream":True}
         if enable_thinking is not None:
-            body["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
+            body["enable_thinking"] = enable_thinking
+        if temp:
+            try:
+                body["temperature"] = float(temp)
+            except ValueError:
+                pass
+        if max_tokens:
+            try:
+                body["max_tokens"] = int(max_tokens)
+            except ValueError:
+                pass
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type":"application/json"})
         print("\033[1;35massistant>\033[0m ", end="", flush=True)
         full = ""
@@ -429,31 +457,34 @@ finally:
     termios.tcsetattr(FD, termios.TCSANOW, old_term)
 
 PY
-)" "$url" "$model" "$sysp" "$thinking" "$chat_log"
+)" "$url" "$model" "$sysp" "$thinking" "$chat_log" "$YMLX_QUICK_TEMP" "$YMLX_QUICK_MAX_TOKENS"
   }
 
   _ymlx_apply_quick() {
-    local cta=""
+    # Thinking is a bare flag in mlx_vlm: --enable-thinking turns it on by
+    # default for requests that don't send top-level enable_thinking. "on"
+    # forces the flag on; "off" removes it (requests can still force it off
+    # per request, as the chat REPL does); "default" leaves hand-written flags
+    # in the config untouched.
     case "$YMLX_QUICK_THINKING" in
-      on)  cta='{"enable_thinking": true}' ;;
-      off) cta='{"enable_thinking": false}' ;;
+      on)  _ymlx_flag_set YMLX_CHAT_FLAGS --enable-thinking 1
+           _ymlx_flag_set YMLX_SERVER_FLAGS --enable-thinking 1 ;;
+      off) _ymlx_flag_set YMLX_CHAT_FLAGS --enable-thinking 0
+           _ymlx_flag_set YMLX_SERVER_FLAGS --enable-thinking 0 ;;
     esac
-    if [[ -n "$cta" ]]; then
-      _ymlx_replace_or_append YMLX_CHAT_FLAGS --chat-template-args "$cta"
-      _ymlx_replace_or_append YMLX_SERVER_FLAGS --chat-template-args "$cta"
-    fi
     if [[ -n "$YMLX_QUICK_TEMP" ]]; then
-      _ymlx_replace_or_append YMLX_CHAT_FLAGS --temp "$YMLX_QUICK_TEMP"
-      _ymlx_replace_or_append YMLX_SERVER_FLAGS --temp "$YMLX_QUICK_TEMP"
+      _ymlx_replace_or_append YMLX_CHAT_FLAGS --temperature "$YMLX_QUICK_TEMP"
+      # mlx_vlm.server has no server-level temperature flag — temperature is a
+      # per-request field, which the chat REPL sends (and API clients send).
     fi
     if [[ -n "$YMLX_QUICK_MAX_TOKENS" ]]; then
       _ymlx_replace_or_append YMLX_CHAT_FLAGS --max-tokens "$YMLX_QUICK_MAX_TOKENS"
       _ymlx_replace_or_append YMLX_SERVER_FLAGS --max-tokens "$YMLX_QUICK_MAX_TOKENS"
     fi
-    if [[ -n "$YMLX_QUICK_SYSTEM_PROMPT" ]]; then
-      _ymlx_replace_or_append YMLX_CHAT_FLAGS --system-prompt "$YMLX_QUICK_SYSTEM_PROMPT"
-      _ymlx_replace_or_append YMLX_SERVER_FLAGS --system-prompt "$YMLX_QUICK_SYSTEM_PROMPT"
-    fi
+    # System prompts are per-request only: mlx_vlm has no --system-prompt flag
+    # (server or chat), and YMLX_CHAT_FLAGS is informational, so there is
+    # nothing to write here — the chat REPL injects YMLX_QUICK_SYSTEM_PROMPT
+    # into the request messages and API clients pass it in the body.
   }
 
   # Rewrite the managed block in config.zsh from current YMLX_QUICK_* values.
@@ -581,6 +612,11 @@ PY
     if [[ -n "$running_model" ]]; then
       _ymlx_stop_all >/dev/null 2>&1
       echo "Restarting: $running_model"
+      local i
+      for i in {1..40}; do
+        _ymlx_port_free 11500 && break
+        sleep 0.2
+      done
       _ymlx_launch "$running_model"
     else
       echo "No model is running — nothing to restart."
@@ -591,7 +627,59 @@ PY
   [[ -f "$config_file" ]] || _ymlx_write_default_config "$config_file"
   _ymlx_reload_config
 
-# Discover the currently running mlx_lm.server on :11500 by asking the OS, not
+#
+# HuggingFace token handling. mlx-vlm downloads models from the HF Hub; without
+# a token it warns "sending unauthenticated requests". These helpers expose an
+# existing token (env or the on-disk cache that `huggingface-cli login` / an
+# earlier ymlx login wrote) and offer a one-shot wizard to save one.
+#
+_ymlx_hf_token_file() {
+  print -r -- "${HF_HOME:-$HOME/.cache/huggingface}/token"
+}
+
+_ymlx_hf_has_token() {
+  [[ -n "$HF_TOKEN" ]] && return 0
+  [[ -s "$(_ymlx_hf_token_file)" ]] && return 0
+  return 1
+}
+
+_ymlx_hf_setup() {
+  local action tok tf
+  tf=$(_ymlx_hf_token_file)
+  echo
+  gum style --foreground 212 --bold "HuggingFace authentication"
+  gum style --foreground 250 "ymlx downloads models from the HuggingFace Hub. Adding a token gets you"
+  gum style --foreground 250 "higher rate limits + faster downloads and unlocks gated/private models."
+  gum style --foreground 244 "(Without one, ymlx just warns and still works for public models.)"
+  echo
+  action=$(printf "Paste a token now\nSkip (public models only)" | gum choose --header "Hugging Face token?" --height 5)
+  if [[ -z "$action" || "$action" != "Paste"* ]]; then
+    echo "Skipped — public model downloads will simply be unauthenticated."
+    return 1
+  fi
+  tok=$(gum input --prompt "Token: " --placeholder "hf_...  (create one at https://huggingface.co/settings/tokens)")
+  tok="${tok//[[:space:]]/}"
+  if [[ -z "$tok" ]]; then
+    echo "No token entered — skipped."
+    return 1
+  fi
+  mkdir -p "${tf:h}"
+  chmod 700 "${tf:h}" 2>/dev/null
+  printf '%s\n' "$tok" > "$tf"
+  chmod 600 "$tf" 2>/dev/null
+  export HF_TOKEN="$tok"
+  echo "✓ Authenticated — saved to $tf (shared with other HuggingFace tools)."
+  return 0
+}
+
+# If a token is already on disk (written by an earlier ymlx login or by
+# `uvx huggingface_hub[cli] huggingface-cli login`), export it so every download
+# subprocess this session is authenticated and the warning stops appearing.
+if [[ -z "$HF_TOKEN" && -s "$(_ymlx_hf_token_file)" ]]; then
+  export HF_TOKEN="$(<"$(_ymlx_hf_token_file)")"
+fi
+
+# Discover the currently running mlx_vlm.server on :11500 by asking the OS, not
 # a state file. Emits a TSV line: pid<TAB>port<TAB>model.
 # The model id is parsed from the process's --model arg.
 _ymlx_running() {
@@ -626,8 +714,6 @@ _ymlx_running() {
     _YMLX_SESSION_PIDS=()
   }
 
-  _ymlx_size_load "$size_cache_file"
-
   _ymlx_launch() {
     local model="$1"
     local port=$(_ymlx_find_port)
@@ -637,12 +723,14 @@ _ymlx_running() {
     fi
     local safe="${model//\//_}"
     local log="$log_dir/${safe}-${port}.log"
-    mlx_lm.server --model "$model" --port "$port" "${YMLX_SERVER_FLAGS[@]}" >"$log" 2>&1 &
+    mlx_vlm.server --model "$model" --port "$port" "${YMLX_SERVER_FLAGS[@]}" >"$log" 2>&1 &
     local pid=$!
     _YMLX_SESSION_PIDS+=( "$pid" )
     local rc=0
     gum spin --spinner dot --title "Initializing $model… (Ctrl-C to cancel)" -- zsh -c "
+      local n=0
       while kill -0 $pid 2>/dev/null; do
+        (( n++ > 2400 )) && exit 1
         [[ -s '$log' ]] && exit 0
         sleep 0.3
       done
@@ -652,7 +740,9 @@ _ymlx_running() {
     if (( rc == 0 )); then
       echo "  ✓ Initialized"
       gum spin --spinner dot --title "Loading model weights…" -- zsh -c "
+        local n=0
         while kill -0 $pid 2>/dev/null; do
+          (( n++ > 2400 )) && exit 1
           curl -fs -o /dev/null --max-time 1 http://127.0.0.1:$port/v1/models && exit 0
           grep -qE 'Starting|Uvicorn|running|listening|Application startup' '$log' 2>/dev/null && exit 0
           sleep 0.5
@@ -664,7 +754,9 @@ _ymlx_running() {
     if (( rc == 0 )); then
       echo "  ✓ Weights loaded"
       gum spin --spinner dot --title "Warming up server on :$port…" -- zsh -c "
+        local n=0
         while kill -0 $pid 2>/dev/null; do
+          (( n++ > 2400 )) && exit 1
           curl -fs -o /dev/null --max-time 1 http://127.0.0.1:$port/v1/models && exit 0
           sleep 0.5
         done
@@ -794,11 +886,21 @@ _ymlx_running() {
       model="${curated[$pick]}"
     fi
     [[ -z "$model" ]] && return
+
+    # First download of the session without a token: offer to set one so the
+    # "unauthenticated requests" warning goes away. Skipping is remembered for
+    # the rest of this session, so it stays out of the way.
+    if ! _ymlx_hf_has_token && (( _YMLX_HF_SKIPPED == 0 )); then
+      if ! _ymlx_hf_setup; then
+        _YMLX_HF_SKIPPED=1
+      fi
+    fi
+
     echo
     gum style --foreground 212 --bold "Downloading $model"
     echo "(progress will stream below — Ctrl-C to abort)"
     echo
-    if uvx --from mlx-lm python3 -c "from mlx_lm import load; load('$model')"; then
+    if uvx --from mlx-vlm python3 -c "from mlx_vlm.utils import load; load('$model')"; then
       echo
       gum style --foreground 42 "✓ Downloaded: $model"
       echo
@@ -1071,6 +1173,7 @@ _ymlx_running() {
     else
       echo "Server for $model was already gone."
     fi
+    gum input --placeholder "(press enter to continue)" >/dev/null
     _ymlx_main_rebuild_full
   }
 
@@ -1086,6 +1189,7 @@ _ymlx_running() {
     local folder="$hub_dir/models--${model//\//--}"
     if [[ ! -d "$folder" ]]; then
       echo "Folder not found: $folder"
+      gum input --placeholder "(press enter to continue)" >/dev/null
     else
       local warn=""
       [[ -n "$port" ]] && warn=" (running server will be stopped first)"
@@ -1100,9 +1204,8 @@ _ymlx_running() {
           [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && _ymlx_drop "$pid"
         fi
         rm -rf "$folder"
-        unset "_ymlx_size_mt[$model]" "_ymlx_size_kb[$model]"
-        _ymlx_size_save "$size_cache_file"
         echo "Removed: $model"
+        gum input --placeholder "(press enter to continue)" >/dev/null
       fi
     fi
     _ymlx_main_rebuild_full
@@ -1232,10 +1335,115 @@ _ymlx_running() {
     done
   }
 
+  # Headless (non-interactive) helpers -------------------------------
+  _ymlx_running_model() {  # echoes pid\tport\tmodel (or nothing)
+    local line
+    line="$(_ymlx_running)" && [[ -n "$line" ]] && print "$line"
+  }
+
+  _ymlx_headless_launch() {
+    local model="$1"
+    local port
+    port=$(_ymlx_find_port)
+    if [[ -z "$port" ]]; then
+      print -u2 "ymlx: port 11500 is busy — stop the running model first (ymlx stop)"
+      return 1
+    fi
+    local safe="${model//\//_}"
+    local log="$log_dir/${safe}-${port}.log"
+    mlx_vlm.server --model "$model" --port "$port" "${YMLX_SERVER_FLAGS[@]}" >"$log" 2>&1 &!
+    local pid=$!
+    print "ymlx: starting $model on :$port (pid $pid) — log: $log"
+    local i
+    for i in {1..2400}; do   # ~ up to 20 min for large/quantized models
+      if ! kill -0 "$pid" 2>/dev/null; then
+        print -u2 "ymlx: server exited while loading — last log lines:"
+        tail -n 20 "$log" >&2
+        return 1
+      fi
+      if curl -fs -o /dev/null --max-time 1 "http://127.0.0.1:$port/v1/models" 2>/dev/null; then
+        print "ymlx: ready $model on :$port (pid $pid)"
+        return 0
+      fi
+      sleep 0.5
+    done
+    print -u2 "ymlx: timed out waiting for $model to serve — log: $log"
+    return 1
+  }
+
+  _ymlx_headless_run() {
+    local model="$1"
+    if [[ -z "$model" ]]; then
+      print -u2 "usage: ymlx run <model-id>, e.g. ymlx run mlx-community/Qwen3-8B"
+      return 2
+    fi
+    # Fast path: the requested model is already serving.
+    if [[ -n "$(_ymlx_running_model)" ]]; then
+      local pid port cur
+      read -r pid port cur <<< "$(_ymlx_running_model)"
+      if [[ "$cur" == "$model" ]]; then
+        print "ymlx: $model already running on :$port (pid $pid)"
+        return 0
+      fi
+      print "ymlx: stopping $cur (pid $pid) to switch to $model"
+      kill "$pid" 2>/dev/null
+      local i
+      for i in {1..40}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+      done
+    fi
+    _ymlx_headless_launch "$model"
+    return $?
+  }
+
+  _ymlx_headless_stop() {
+    if [[ -n "$(_ymlx_running_model)" ]]; then
+      local pid port cur
+      read -r pid port cur <<< "$(_ymlx_running_model)"
+      kill "$pid" 2>/dev/null && print "ymlx: stopped $cur (pid $pid)"
+      return 0
+    fi
+    print "ymlx: nothing running on :11500"
+    return 0
+  }
+
+  _ymlx_headless_status() {
+    if [[ -n "$(_ymlx_running_model)" ]]; then
+      local pid port cur
+      read -r pid port cur <<< "$(_ymlx_running_model)"
+      print "$cur\t:$port\tpid $pid"
+      return 0
+    fi
+    print "none"
+    return 1
+  }
+
+  # ---- headless (non-interactive) mode --------------------------
+  # ``ymlx <sub> [args]`` runs and exits without the TUI. Designed for
+  # automation (pi's model_select hook), so servers are DETACHED: they must
+  # survive this shell exiting, so we clear the EXIT trap, never add the pid
+  # to _YMLX_SESSION_PIDS, and disown it.
+  if (( $# > 0 )); then
+    local _YMLX_HEADLESS=1
+    trap - EXIT INT TERM HUP
+    local _sub="$1"; shift
+    case "$_sub" in
+      run)        _ymlx_headless_run      "$@" ;;
+      stop)       _ymlx_headless_stop     "$@" ;;
+      status)     _ymlx_headless_status   "$@" ;;
+      *) print -u2 "ymlx: unknown command '$_sub'"; print -u2 "usage: ymlx {run <model-id>|stop|status}"; return 2 ;;
+    esac
+    return
+  fi
+
   clear
   echo
   gum style --foreground 212 --bold "▌▌ YMLX"
   gum style --foreground 244 "Runs an MLX model behind an OpenAI-compatible REST API at localhost:11500"
+  if ! _ymlx_hf_has_token; then
+    gum style --foreground 244 "HF Hub: unauthenticated — downloads still work but are slower. Offer a token at the first download."
+  fi
 
   while true; do
     _ymlx_main_standard

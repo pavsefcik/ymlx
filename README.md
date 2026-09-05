@@ -6,7 +6,7 @@ Exposes an OpenAI-compatible REST API at `localhost:11500`.
 ## What it does
 
 - Lists installed models from `~/.cache/huggingface/hub`
-- Runs the selected model on `:11500` via `mlx-lm` — one model at a time; Enter starts it and drops straight into chat
+- Runs the selected model on `:11500` via `mlx-vlm` — one model at a time; Enter starts it and drops straight into chat
 - Three-phase loading spinner (initialize → load weights → warm up); cancellable mid-load
 - Built-in chat REPL; `tab` toggles thinking per-request (sent as `enable_thinking`, so it actually turns reasoning on/off), thinking renders dim/gray and the answer white, `esc` stops generation
 - Chat history viewer in the main menu
@@ -17,15 +17,23 @@ Exposes an OpenAI-compatible REST API at `localhost:11500`.
 ## Requirements
 
 - Apple Silicon Mac (MLX is Apple Silicon only)
-- [`uv`](https://github.com/astral-sh/uv) — provides `uvx`, used to fetch `mlx-lm` on demand
+- [`uv`](https://github.com/astral-sh/uv) — provides `uvx`, used to fetch `mlx-vlm` on demand
 - [`gum`](https://github.com/charmbracelet/gum) — interactive menus
-- [`mlx-lm`](https://github.com/ml-explore/mlx-lm) — running chat/server uses `mlx_lm.chat` and `mlx_lm.server` directly.
+- [`mlx-vlm`](https://github.com/Blaizzy/mlx-vlm) — running chat/server uses `mlx_vlm.chat` and `mlx_vlm.server` directly. Unlike `mlx-lm`, it also serves multimodal models: curated models tagged `vision`/`audio` accept image/audio content over the same endpoint.
 
-Install the CLI tools:
+Install the CLI tools — either run the bundled bootstrap (handles everything below, including a PATH fix for `~/.local/bin`):
 
 ```sh
-brew install uv gum && uv tool install mlx-lm
+zsh install.zsh
 ```
+
+…or install by hand (same result):
+
+```sh
+brew install uv gum && uv tool install mlx-vlm --with jinja2
+```
+
+(`--with jinja2` is required: mlx-vlm's `apply_chat_template` needs it for every chat request, and mlx-vlm's own requirements don't declare it.)
 
 ## Install
 
@@ -61,7 +69,7 @@ Point [pi](https://pi-coding.org) at the same endpoint by adding a provider to `
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": false,
-        "thinkingFormat": "qwen-chat-template"
+        "thinkingFormat": "qwen"
       },
       "models": [
         {
@@ -80,20 +88,20 @@ Point [pi](https://pi-coding.org) at the same endpoint by adding a provider to `
 }
 ```
 
-The `reasoning: true` + `thinkingFormat: "qwen-chat-template"` pair is what makes the thinking toggle work: Pi then sends `chat_template_kwargs.enable_thinking` (and `preserve_thinking`) per request — the exact knob `mlx_lm.server` reads — so `Shift+Tab` in Pi turns thinking on/off per request. Note that per-request `chat_template_kwargs` override ymlx's server-side `--chat-template-args`, so Pi's toggle wins over the Basic-settings Thinking value; set the menu value to `default` if you want Pi to fully own thinking.
+The `reasoning: true` + `thinkingFormat: "qwen"` pair is what makes the thinking toggle work: Pi then sends a top-level `enable_thinking` per request — the exact field `mlx_vlm.server` reads — so `Shift+Tab` in Pi turns thinking on/off per request. Note that per-request `enable_thinking` overrides ymlx's server-side `--enable-thinking`, so Pi's toggle wins over the Basic-settings Thinking value; set the menu value to `default` if you want Pi to fully own thinking.
 
 ## Configuration
 
 Pick **Basic settings** from the main menu for the four quick toggles you'll actually flip between sessions:
 
-- **Thinking** — `default` / `on` / `off` (sets `--chat-template-args '{"enable_thinking": …}'` for chat and server)
+- **Thinking** — `default` / `on` / `off` (adds/removes server-side `--enable-thinking`; the chat REPL and Pi still force it per request)
 - **Temperature** — preset (0.0 / 0.3 / 0.7 / 1.0) or custom
 - **Max tokens** — preset (512 / 2048 / 8192 / 32768) or custom
 - **System prompt** — multi-line `gum write` editor; chat only
 
 These persist in a managed block at the top of `~/.cache/ymlx/config.zsh` (auto-created on first run; Thinking starts at `off` since it's the value most users want). Basic settings is in the main menu, so it's always one keystroke away. In the main menu, navigate with ↑/↓, press Enter to start or chat, Tab to toggle thinking, `^s` to stop the running server, `^d` to delete the selected model, and `^q` (or Esc) to quit.
 
-Selecting **Advanced settings** opens the config file in your editor — `micro` if installed, otherwise `nano`, then `$VISUAL` / `$EDITOR`, finally `vi`. Below the managed block live two arrays, `YMLX_CHAT_FLAGS` and `YMLX_SERVER_FLAGS`, with every flag from `mlx_lm.chat --help` / `mlx_lm.server --help` listed (commented out by default): `--draft-model`, `--seed`, `--top-k` / `--min-p`, `--xtc-*`, concurrency knobs, adapter paths, etc. `--model`, `--port`, and `--host` stay managed by ymlx. Changes take effect immediately on save — no ymlx restart needed. Use **Restart and refresh** to apply flag changes to a running model, or **Open models folder** to browse `~/.cache/huggingface/hub` in Finder.
+Selecting **Advanced settings** opens the config file in your editor — `micro` if installed, otherwise `nano`, then `$VISUAL` / `$EDITOR`, finally `vi`. Below the managed block live two arrays, `YMLX_CHAT_FLAGS` and `YMLX_SERVER_FLAGS`, with every flag from `mlx_vlm.chat --help` / `mlx_vlm.server --help` listed (commented out by default): `--draft-model`, `--kv-bits` / `--kv-quant-scheme`, thinking budget & start/end token flags, adapter paths, and extra model slots (`--image-model`, `--tts-model`, `--stt-model`, `--embedding-model`, `--reranker-model`), etc. `--model`, `--port`, and `--host` stay managed by ymlx. Changes take effect immediately on save — no ymlx restart needed. Use **Restart and refresh** to apply flag changes to a running model, or **Open models folder** to browse `~/.cache/huggingface/hub` in Finder.
 
 ## Curated model list
 

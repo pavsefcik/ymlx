@@ -1,7 +1,6 @@
 # ymlx helpers — self-contained, arg-driven utilities extracted from the main
-# ymlx() body. None of these read ymlx()'s locals; paths needed by the size
-# cache are passed in as arguments. Sourced once by ymlx.zsh before ymlx() is
-# defined.
+# ymlx() body. None of these read ymlx()'s locals. Sourced once by ymlx.zsh
+# before ymlx() is defined.
 
 # Pick a beginner-friendly editor: micro > nano > $EDITOR/$VISUAL > vi.
 _ymlx_pick_editor() {
@@ -30,6 +29,21 @@ _ymlx_replace_or_append() {
   eval "${name}=( \"\${arr[@]}\" )"
 }
 
+# Ensure (add=1) or remove (add=0) a valueless flag in a named array (e.g.
+# --enable-thinking). Removes duplicates, then appends if adding.
+_ymlx_flag_set() {
+  local name="$1" flag="$2" add="$3"
+  local -a arr out
+  eval "arr=( \"\${${name}[@]}\" )"
+  local i
+  for (( i=1; i<=${#arr[@]}; i++ )); do
+    [[ "${arr[i]}" == "$flag" ]] && continue
+    out+=( "${arr[i]}" )
+  done
+  (( add )) && out+=( "$flag" )
+  eval "${name}=( \"\${out[@]}\" )"
+}
+
 # Is TCP port $1 free (nothing listening)?
 _ymlx_port_free() {
   ! lsof -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
@@ -52,31 +66,4 @@ _ymlx_friendly_name() {
 
 _ymlx_display_name() {
   _ymlx_friendly_name "$1"
-}
-
-# Disk-usage cache. The associative arrays (_ymlx_size_mt/_ymlx_size_kb) are
-# declared global here; the cache file path is passed in by the caller.
-typeset -gA _ymlx_size_mt _ymlx_size_kb
-
-# Load $cache_file (model<TAB>mtime<TAB>kb) into the size cache.
-_ymlx_size_load() {
-  local cache_file="$1"
-  [[ -f "$cache_file" ]] || return
-  local m mt kb
-  while IFS=$'\t' read -r m mt kb; do
-    [[ -z "$m" ]] && continue
-    _ymlx_size_mt[$m]=$mt
-    _ymlx_size_kb[$m]=$kb
-  done < "$cache_file"
-}
-
-# Write the size cache back to $cache_file.
-_ymlx_size_save() {
-  local cache_file="$1"
-  local tmp="$cache_file.tmp" m
-  : > "$tmp"
-  for m in ${(k)_ymlx_size_kb}; do
-    printf '%s\t%s\t%s\n' "$m" "${_ymlx_size_mt[$m]}" "${_ymlx_size_kb[$m]}" >> "$tmp"
-  done
-  mv "$tmp" "$cache_file"
 }
