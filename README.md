@@ -47,6 +47,41 @@ Once a model is running, ymlx prints a **Use from another app** summary after la
 
 ymlx is a drop-in OpenAI-compatible endpoint, so anything that talks to OpenAI works against ymlx after changing those three values. To point the same URL at a different model, stop the running one (^s) and start the new model — the URL stays the same.
 
+### Use from Pi (coding agent)
+
+Point [pi](https://pi-coding.org) at the same endpoint by adding a provider to `~/.pi/agent/models.json` (create the file if missing):
+
+```json
+{
+  "providers": {
+    "ymlx": {
+      "baseUrl": "http://localhost:11500/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "thinkingFormat": "qwen-chat-template"
+      },
+      "models": [
+        {
+          "id": "<hf-id-of-the-running-model>",
+          "name": "Local MLX (ymlx)",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 8192,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+          "thinkingLevelMap": { "off": "off", "low": "on", "high": "on" }
+        }
+      ]
+    }
+  }
+}
+```
+
+The `reasoning: true` + `thinkingFormat: "qwen-chat-template"` pair is what makes the thinking toggle work: Pi then sends `chat_template_kwargs.enable_thinking` (and `preserve_thinking`) per request — the exact knob `mlx_lm.server` reads — so `Shift+Tab` in Pi turns thinking on/off per request. Note that per-request `chat_template_kwargs` override ymlx's server-side `--chat-template-args`, so Pi's toggle wins over the Basic-settings Thinking value; set the menu value to `default` if you want Pi to fully own thinking.
+
 ## Configuration
 
 Pick **Basic settings** from the main menu for the four quick toggles you'll actually flip between sessions:
