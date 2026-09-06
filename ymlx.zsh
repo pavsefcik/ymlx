@@ -1234,7 +1234,7 @@ _ymlx_running() {
   }
 
   # "Update to latest version" from the menu — adapts to how ymlx was installed:
-  # a git clone pulls + re-runs install.zsh; a pi-managed package tells the user
+  # a git clone pulls + re-runs install.sh; a pi-managed package tells the user
   # to use `pi update`; anything else (e.g. the stable copy from /ymlx-setup) asks
   # for a re-install. Re-checks afterwards so the banner clears once current.
   _ymlx_do_update() {
@@ -1243,7 +1243,7 @@ _ymlx_running() {
     if [[ -d "$_YMLX_SRC_DIR/.git" ]]; then
       echo "Pulling latest from git ($_YMLX_SRC_DIR):"
       if git -C "$_YMLX_SRC_DIR" pull --ff-only; then
-        zsh "$_YMLX_SRC_DIR/install.zsh"
+        sh "$_YMLX_SRC_DIR/install.sh"
         echo
         gum style --foreground 82 --bold "ymlx updated — quit and re-run ymlx to use the new version."
         _ymlx_check_update
@@ -1255,7 +1255,7 @@ _ymlx_running() {
       echo "  pi update --extensions"
       echo "then restart ymlx."
     else
-      echo "This ymlx is a managed copy. Refresh it by re-running install.zsh or"
+      echo "This ymlx is a managed copy. Refresh it by re-running install.sh or"
       echo "/ymlx-setup, then restart ymlx."
     fi
     gum input --placeholder "(press enter to continue)" >/dev/null

@@ -7,7 +7,7 @@
  *
  *   pi install git:github.com/pavsefcik/ymlx
  *
- * or copied into ~/.pi/agent/extensions/ymlx-sync.ts — `zsh install.zsh` from a
+ * or copied into ~/.pi/agent/extensions/ymlx-sync.ts — `sh install.sh` from a
  * clone does the copy and generates the ~/.pi/agent/bin/ymlx wrapper for you.
  * Hot-reload with /reload. The factory runs on every pi start and /reload.
  *
@@ -58,7 +58,7 @@ const execFileP = promisify(execFile);
 
 // Provider name for ymlx in pi's model catalog (defaults to "local", matching models.json).
 const YMLX_PROVIDER = process.env.YMLX_PI_PROVIDER ?? "local";
-// Wrapper that executes the real ymlx.zsh headlessly. install.zsh writes this;
+// Wrapper that executes the real ymlx.zsh headlessly. install.sh writes this;
 // /ymlx-setup can too.
 const WRAPPER =
   process.env.YMLX_BIN ?? join(homedir(), ".pi", "agent", "bin", "ymlx");
@@ -67,7 +67,7 @@ const HUB_DIR =
   process.env.YMLX_HUB_DIR ?? join(homedir(), ".cache", "huggingface", "hub");
 // Stable copy target for ymlx.zsh + lib/: pi git-packages get reset on
 // `pi update --extensions`, so the wrapper must never point into the package
-// clone. install.zsh points the wrapper at the repo directly (fine — it's the
+// clone. install.sh points the wrapper at the repo directly (fine — it's the
 // user's own clone); /ymlx-setup copies into this dir instead.
 const YMLX_STABLE =
   process.env.YMLX_STABLE_DIR ?? join(homedir(), ".local", "share", "ymlx");
@@ -270,14 +270,14 @@ async function wireYmlx(ui: SetupUI): Promise<boolean> {
       return false;
     }
   } else if (!(await pathOk(WRAPPER))) {
-    // No ymlx.zsh anywhere and no existing wrapper (e.g. install.zsh never ran).
+    // No ymlx.zsh anywhere and no existing wrapper (e.g. install.sh never ran).
     ui.notify(
-      "ymlx-setup: can't find ymlx.zsh. Clone it and set YMLX_REPO (or run its install.zsh), or set YMLX_ZSH=/path/to/ymlx.zsh, then /reload and re-run /ymlx-setup.",
+      "ymlx-setup: can't find ymlx.zsh. Clone it and set YMLX_REPO (or run its install.sh), or set YMLX_ZSH=/path/to/ymlx.zsh, then /reload and re-run /ymlx-setup.",
       "error"
     );
     return false;
   } else {
-    // Existing wrapper (install.zsh generated it, pointing at the user's clone).
+    // Existing wrapper (install.sh generated it, pointing at the user's clone).
     return true;
   }
 
