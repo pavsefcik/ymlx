@@ -6,11 +6,10 @@ Apple Silicon, with a drop-in OpenAI-compatible REST endpoint at
 
 ## Install
 
-The repo ships as a [pi package](https://pi.dev/packages) — install pi once,
-then everything else comes from in-pi commands:
+The repo ships as a [pi package](https://pi.dev/packages) — install pi once
+[pi](https://pi.dev), then everything else comes from in-pi commands:
 
 ```sh
-npm i -g @earendil-works/pi-coding-agent
 pi install git:github.com/pavsefcik/ymlx
 ```
 
@@ -27,8 +26,7 @@ new shell.
 
 ### Standalone — one line (curl)
 
-Requires Xcode CLT and Homebrew to be present first. Installs to `~/.ymlx`
-(`YMLX_DIR` to override) and wires the launcher into `~/.zshrc`:
+Installs to `~/.ymlx` (`YMLX_DIR` to override) and wires the launcher into `~/.zshrc`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/pavsefcik/ymlx/main/install.sh | sh
