@@ -6,8 +6,7 @@ Apple Silicon, with a drop-in OpenAI-compatible REST endpoint at
 
 ## Install
 
-The repo ships as a [pi package](https://pi.dev/packages) — install pi once
-[pi](https://pi.dev), then everything else comes from in-pi commands:
+The repo ships as a [pi package](https://pi.dev/packages) — install [pi](https://pi.dev) once, then everything else comes from in-pi commands:
 
 ```sh
 pi install git:github.com/pavsefcik/ymlx
