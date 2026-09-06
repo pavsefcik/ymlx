@@ -4,14 +4,6 @@ A small zsh launcher for browsing, running and downloading local MLX LLMs on
 Apple Silicon, with a drop-in OpenAI-compatible REST endpoint at
 `localhost:11500`.
 
-## Run
-
-Run it from any terminal with:
-
-```sh
-ymlx
-```
-
 ## Install
 
 The repo ships as a [pi package](https://pi.dev/packages) — install [pi](https://pi.dev) once, then everything else comes from in-pi commands:
@@ -50,6 +42,14 @@ The formula brings `gum` + `uv`; run
 `sh "$(brew --prefix)/opt/ymlx/libexec/install.sh"` once — it installs the
 `mlx-vlm` tool and adds the launcher to `~/.zshrc`. Then open a new terminal
 and run `ymlx`.
+
+## Run
+
+Run it from any terminal with:
+
+```sh
+ymlx
+```
 
 ## Use
 
