@@ -57,38 +57,30 @@ ymlx is a drop-in OpenAI-compatible endpoint, so anything that talks to OpenAI w
 
 ### Use from Pi (coding agent)
 
-Point [pi](https://pi-coding.org) at the same endpoint by adding a provider to `~/.pi/agent/models.json` (create the file if missing):
+## Use from Pi (coding agent)
 
-```json
-{
-  "providers": {
-    "ymlx": {
-      "baseUrl": "http://localhost:11500/v1",
-      "api": "openai-completions",
-      "apiKey": "local",
-      "compat": {
-        "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
-        "thinkingFormat": "qwen"
-      },
-      "models": [
-        {
-          "id": "<hf-id-of-the-running-model>",
-          "name": "Local MLX (ymlx)",
-          "reasoning": true,
-          "input": ["text"],
-          "contextWindow": 131072,
-          "maxTokens": 8192,
-          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-          "thinkingLevelMap": { "off": "off", "low": "on", "high": "on" }
-        }
-      ]
-    }
-  }
-}
+The repo ships as a [pi package](https://pi.dev/packages): the `ymlx-sync` extension keeps pi's model list in sync with what's actually in the HF hub cache, and starts/switches ymlx to the selected model headlessly. No hand-maintained `models.json` needed — the extension registers everything.
+
+Install pi, then:
+
+```sh
+npm i -g @earendil-works/pi-coding-agent
+pi install git:github.com/pavsefcik/ymlx
 ```
 
-The `reasoning: true` + `thinkingFormat: "qwen"` pair is what makes the thinking toggle work: Pi then sends a top-level `enable_thinking` per request — the exact field `mlx_vlm.server` reads — so `Shift+Tab` in Pi turns thinking on/off per request. Note that per-request `enable_thinking` overrides ymlx's server-side `--enable-thinking`, so Pi's toggle wins over the Basic-settings Thinking value; set the menu value to `default` if you want Pi to fully own thinking.
+Then inside pi:
+
+1. **`/ymlx-setup`** — one-time install/repair: uv + gum via brew, `mlx-vlm` (+jinja2) via uv tool, copies `ymlx.zsh` to `~/.local/share/ymlx`, writes the `~/.pi/agent/bin/ymlx` wrapper. Auto-offered on first launch if ymlx isn't wired in yet. (Xcode CLT is the only manual step.)
+2. **`/ymlx-sync`** — scans `~/.cache/huggingface/hub` and re-registers the `local` provider with what's downloaded.
+3. **`/model`** → pick a model under **Local MLX (ymlx)** — pi runs `ymlx run <model-id>` headless and talks to `http://localhost:11500/v1`.
+
+`/reload` after any change to the extension file. No ymlx in the hub cache yet? Run `ymlx` and use **Download new model**.
+
+Alternative install: `git clone` + `zsh install.zsh` — it also copies the extension and generates the wrapper (with your clone's path baked in), so you only need `/reload` inside pi.
+
+Environment knobs (all optional): `YMLX_PI_PROVIDER` (provider name, default `local`), `YMLX_HUB_DIR`, `YMLX_BIN`, `YMLX_REPO`, `YMLX_ZSH`, `YMLX_STABLE_DIR`.
+
+Why thinking works: the extension registers models with `reasoning: true` and `thinkingFormat` so pi sends a top-level `enable_thinking` per request — the exact field `mlx_vlm.server` reads — so Shift+Tab in pi turns thinking on/off per request. Note that per-request `enable_thinking` overrides ymlx's server-side `--enable-thinking`, so pi's toggle wins over the Basic-settings Thinking value; set the menu value to `default` if you want pi to fully own thinking.
 
 ## Configuration
 
