@@ -29,6 +29,24 @@ _ymlx_replace_or_append() {
   eval "${name}=( \"\${arr[@]}\" )"
 }
 
+# Return 0 if semver-ish $1 > $2 (numeric dot-separated fields; non-numeric
+# fields count as 0 — enough to compare ymlx releases). Handles "v" prefixes
+# and unequal field counts (0.1 == 0.1.0).
+_ymlx_version_gt() {
+  local v1="${1#v}" v2="${2#v}"
+  local -a a=("${(ps:.:)v1}") b=("${(ps:.:)v2}")
+  local i n x y
+  (( n = ${#a} > ${#b} ? ${#a} : ${#b} ))
+  for (( i=1; i<=n; i++ )); do
+    x="${a[$i]-0}"; y="${b[$i]-0}"
+    [[ "$x" == <-> ]] || x=0
+    [[ "$y" == <-> ]] || y=0
+    (( x > y )) && return 0
+    (( x < y )) && return 1
+  done
+  return 1
+}
+
 # Ensure (add=1) or remove (add=0) a valueless flag in a named array (e.g.
 # --enable-thinking). Removes duplicates, then appends if adding.
 _ymlx_flag_set() {

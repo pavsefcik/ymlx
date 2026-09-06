@@ -9,7 +9,8 @@ unsetopt xtrace verbose 2>/dev/null
 typeset -ga _YMLX_SESSION_PIDS=()
 
 # Self-contained helpers (no dependence on ymlx()'s locals) live in lib/.
-source "${0:A:h}/lib/ymlx-helpers.zsh"
+local _YMLX_SRC_DIR="${0:A:h}"
+source "$_YMLX_SRC_DIR/lib/ymlx-helpers.zsh"
 
 ymlx() {
   local YMLX_DEBUG=false
@@ -122,6 +123,8 @@ CFG
   typeset -gi _YMLX_MENU_DRAWN=0
   typeset -gi _YMLX_MENU_NLINES=0
   typeset -gi _YMLX_MENU_NO_MODELS=0
+  typeset -g _YMLX_UPDATE_NEW=""
+  typeset -g _YMLX_UPDATE_INSTALLED=""
   _YMLX_STTY_SAVED="$(stty -g 2>/dev/null)"
 
   _ymlx_talk_info() {
@@ -1070,12 +1073,20 @@ _ymlx_running() {
     fi
   }
 
+  _ymlx_main_header() {
+    gum style --foreground 212 --bold "▌▌ YMLX"
+    gum style --foreground 244 "Runs an MLX model behind an OpenAI-compatible REST API at localhost:11500"
+    if [[ -n "$_YMLX_UPDATE_NEW" && -n "$_YMLX_UPDATE_INSTALLED" ]]; then
+      gum style --foreground 226 --bold "▲ Update available: $_YMLX_UPDATE_INSTALLED → $_YMLX_UPDATE_NEW"
+      gum style --foreground 244 "  Get it: git pull && zsh install.zsh · or: pi update"
+    fi
+  }
+
   _ymlx_main_full_render() {
     print -n -- "\033[2J\033[H"
     _YMLX_MENU_DRAWN=0
     echo
-    gum style --foreground 212 --bold "▌▌ YMLX"
-    gum style --foreground 244 "Runs an MLX model behind an OpenAI-compatible REST API at localhost:11500"
+    _ymlx_main_header
     _ymlx_main_render
   }
 
@@ -1335,6 +1346,26 @@ _ymlx_running() {
     done
   }
 
+  # Self-update notice: compare the installed version (VERSION file next to this
+  # script) with the latest on GitHub. Interactive menu only — headless runs
+  # (run/stop/status) skip the network call. Short timeout, mirrors the
+  # curated-list fetch; offline = no banner.
+  _ymlx_check_update() {
+    (( $# == 0 )) || return 0
+    local installed="$(<"$_YMLX_SRC_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
+    [[ -n "$installed" ]] || return 0
+    _YMLX_UPDATE_NEW=""
+    _YMLX_UPDATE_INSTALLED=""
+    local latest_file="$state_dir/latest-version" latest
+    if curl -fsSL --connect-timeout 3 --max-time 5 "https://raw.githubusercontent.com/pavsefcik/ymlx/main/VERSION" -o "$latest_file" 2>/dev/null; then
+      latest="$(tr -d '[:space:]' < "$latest_file")"
+      if [[ -n "$latest" ]] && _ymlx_version_gt "$latest" "$installed"; then
+        _YMLX_UPDATE_INSTALLED="v$installed"
+        _YMLX_UPDATE_NEW="v$latest"
+      fi
+    fi
+  }
+
   # Headless (non-interactive) helpers -------------------------------
   _ymlx_running_model() {  # echoes pid\tport\tmodel (or nothing)
     local line
@@ -1437,10 +1468,11 @@ _ymlx_running() {
     return
   fi
 
+  _ymlx_check_update "$@"
+
   clear
   echo
-  gum style --foreground 212 --bold "▌▌ YMLX"
-  gum style --foreground 244 "Runs an MLX model behind an OpenAI-compatible REST API at localhost:11500"
+  _ymlx_main_header
   if ! _ymlx_hf_has_token; then
     gum style --foreground 244 "HF Hub: unauthenticated — downloads still work but are slower. Offer a token at the first download."
   fi

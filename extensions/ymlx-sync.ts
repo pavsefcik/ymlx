@@ -260,6 +260,11 @@ async function wireYmlx(ui: SetupUI): Promise<boolean> {
         join(dirname(zsh), "lib", "ymlx-helpers.zsh"),
         join(YMLX_STABLE, "lib", "ymlx-helpers.zsh")
       );
+      // Version lives next to ymlx.zsh (self-update notice reads it); best-effort.
+      await copyFile(
+        join(dirname(zsh), "VERSION"),
+        join(YMLX_STABLE, "VERSION")
+      ).catch(() => {});
     } catch (err) {
       ui.notify(`ymlx-setup: failed copying ymlx.zsh → ${YMLX_STABLE} — ${errMsg(err)}`, "error");
       return false;
