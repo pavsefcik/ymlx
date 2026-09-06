@@ -2,7 +2,7 @@
 
 A small zsh launcher for browsing, running and downloading local MLX LLMs on
 Apple Silicon, with a drop-in OpenAI-compatible REST endpoint at
-`localhost:11500`.
+`localhost:11500`. It runs with the command **`ymlx`**.
 
 ## Install
 
