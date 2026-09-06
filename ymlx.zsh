@@ -976,6 +976,13 @@ _ymlx_running() {
       _YMLX_MENU_MODELS=( "" "" "" "" "" "" )
       _YMLX_MENU_PORTS=( "" "" "" "" "" "" )
       _YMLX_MENU_ACTIONS=( "download" "history" "basic" "advanced" "openhub" "quit" )
+      if [[ -n "$_YMLX_UPDATE_NEW" ]]; then
+        _YMLX_MENU_LINES=( "Update to latest version" "${_YMLX_MENU_LINES[@]}" )
+        _YMLX_MENU_KINDS=( "action" "${_YMLX_MENU_KINDS[@]}" )
+        _YMLX_MENU_ACTIONS=( "update" "${_YMLX_MENU_ACTIONS[@]}" )
+        _YMLX_MENU_MODELS=( "" "${_YMLX_MENU_MODELS[@]}" )
+        _YMLX_MENU_PORTS=( "" "${_YMLX_MENU_PORTS[@]}" )
+      fi
     else
       for m in ${(f)models}; do
         friendly=$(_ymlx_display_name "$m")
@@ -1002,6 +1009,11 @@ _ymlx_running() {
       _YMLX_MENU_LINES+=( "──────────────────────" )
       _YMLX_MENU_KINDS+=( "separator" )
       _YMLX_MENU_MODELS+=( "" ); _YMLX_MENU_PORTS+=( "" ); _YMLX_MENU_ACTIONS+=( "" )
+      if [[ -n "$_YMLX_UPDATE_NEW" ]]; then
+        _YMLX_MENU_LINES+=( "Update to latest version" )
+        _YMLX_MENU_KINDS+=( "action" )
+        _YMLX_MENU_MODELS+=( "" ); _YMLX_MENU_PORTS+=( "" ); _YMLX_MENU_ACTIONS+=( "update" )
+      fi
       _YMLX_MENU_LINES+=( "Chat history" "Basic settings" "Advanced settings" "Open models folder" "Download new model" "Restart and refresh" "Stop and quit" )
       _YMLX_MENU_KINDS+=( "action" "action" "action" "action" "action" "action" "action" )
       _YMLX_MENU_MODELS+=( "" "" "" "" "" "" "" )
@@ -1078,7 +1090,6 @@ _ymlx_running() {
     gum style --foreground 244 "Runs an MLX model behind an OpenAI-compatible REST API at localhost:11500"
     if [[ -n "$_YMLX_UPDATE_NEW" && -n "$_YMLX_UPDATE_INSTALLED" ]]; then
       gum style --foreground 226 --bold "▲ Update available: $_YMLX_UPDATE_INSTALLED → $_YMLX_UPDATE_NEW"
-      gum style --foreground 244 "  Get it: git pull && zsh install.zsh · or: pi update"
     fi
   }
 
@@ -1222,6 +1233,35 @@ _ymlx_running() {
     _ymlx_main_rebuild_full
   }
 
+  # "Update to latest version" from the menu — adapts to how ymlx was installed:
+  # a git clone pulls + re-runs install.zsh; a pi-managed package tells the user
+  # to use `pi update`; anything else (e.g. the stable copy from /ymlx-setup) asks
+  # for a re-install. Re-checks afterwards so the banner clears once current.
+  _ymlx_do_update() {
+    _ymlx_main_clear
+    gum style --foreground 212 --bold "Updating ymlx"
+    if [[ -d "$_YMLX_SRC_DIR/.git" ]]; then
+      echo "Pulling latest from git ($_YMLX_SRC_DIR):"
+      if git -C "$_YMLX_SRC_DIR" pull --ff-only; then
+        zsh "$_YMLX_SRC_DIR/install.zsh"
+        echo
+        gum style --foreground 82 --bold "ymlx updated — quit and re-run ymlx to use the new version."
+        _ymlx_check_update
+      else
+        echo "git pull had problems — resolve conflicts in $_YMLX_SRC_DIR, then retry."
+      fi
+    elif [[ "$_YMLX_SRC_DIR" == "$HOME"/.pi/agent/git/* ]]; then
+      echo "This install is managed by pi (a pi package). Update it from a terminal:"
+      echo "  pi update --extensions"
+      echo "then restart ymlx."
+    else
+      echo "This ymlx is a managed copy. Refresh it by re-running install.zsh or"
+      echo "/ymlx-setup, then restart ymlx."
+    fi
+    gum input --placeholder "(press enter to continue)" >/dev/null
+    _ymlx_main_rebuild_full
+  }
+
   _ymlx_main_quit() {
     _ymlx_main_clear
     if gum confirm "Quit ymlx and stop all running models?"; then
@@ -1264,6 +1304,7 @@ _ymlx_running() {
       fi
     else
       case "$action" in
+        update) _ymlx_do_update ;;
         download) _ymlx_download_menu ;;
         history) _ymlx_chat_history_menu ;;
         basic) _ymlx_basic_settings_menu ;;
@@ -1360,8 +1401,8 @@ _ymlx_running() {
     if curl -fsSL --connect-timeout 3 --max-time 5 "https://raw.githubusercontent.com/pavsefcik/ymlx/main/VERSION" -o "$latest_file" 2>/dev/null; then
       latest="$(tr -d '[:space:]' < "$latest_file")"
       if [[ -n "$latest" ]] && _ymlx_version_gt "$latest" "$installed"; then
-        _YMLX_UPDATE_INSTALLED="v$installed"
-        _YMLX_UPDATE_NEW="v$latest"
+        _YMLX_UPDATE_INSTALLED="$installed"
+        _YMLX_UPDATE_NEW="$latest"
       fi
     fi
   }

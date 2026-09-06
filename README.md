@@ -24,6 +24,25 @@ Prefer ymlx standalone (no pi)? `git clone` the repo and run
 `zsh install.zsh` — same deps, plus the pi extension and wrapper. Source
 `ymlx-launcher.zsh` from `~/.zshrc` to get `ymlx` in any shell.
 
+### Standalone — one line (curl)
+
+Requires Xcode CLT and Homebrew to be present first. Installs to `~/.ymlx`
+(`YMLX_DIR` to override) and wires the launcher into `~/.zshrc`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pavsefcik/ymlx/main/install.sh | sh
+```
+
+### Standalone — Homebrew (tap)
+
+```sh
+brew tap pavsefcik/ymlx
+brew install ymlx
+```
+
+The formula brings `gum` + `uv`; run `zsh "$(brew --prefix)/opt/ymlx/libexec/install.zsh"`
+once to install the `mlx-vlm` tool, then source the launcher from `~/.zshrc`.
+
 ## Use
 
 - One model at a time on `:11500` — Enter starts it and drops straight into chat
@@ -43,8 +62,8 @@ prompt. **Advanced settings** — every `mlx_vlm` flag (`--kv-bits`,
 
 ## Updates
 
-ymlx checks GitHub for a newer version at every launch; when one exists the
-menu shows `▲ Update available: vX.Y.Z → vA.B.C` with the update command.
-Installed version lives in the repo-root `VERSION` file (semver, currently
-0.1.0). Update with `git pull && zsh install.zsh` (clone) or `pi update`
-(pi package).
+ymlx checks GitHub for a newer version at every launch; when one exists a
+`▲ Update available: X.Y.Z → A.B.C` banner appears and the menu gains an
+**Update to latest version** entry that pulls and reinstalls in place (a
+pi-managed install instead guides you to `pi update`). Installed version lives
+in the repo-root `VERSION` file (semver, currently 0.1.0).
