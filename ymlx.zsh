@@ -28,11 +28,26 @@ ymlx() {
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
   done
   if (( ${#missing[@]} > 0 )); then
-    print -u2 "ymlx: missing required tool(s): ${missing[*]}"
-    print -u2 ""
-    print -u2 "Install with:"
-    print -u2 "  brew install uv gum && uv tool install mlx-vlm --with jinja2"
-    return 1
+    # One-shot repair: interactive startup auto-installs a missing mlx-vlm
+    # (the one missing piece uv can fix on its own); anything else — or any
+    # missing tool in headless mode — still aborts with instructions so
+    # automation (pi's model_select hook) fails loudly and fast.
+    if (( $# == 0 && ${#missing[@]} == 1 && ${missing[1]} == "mlx_vlm.server" )) \
+       && command -v uv >/dev/null 2>&1; then
+      print -u2 "ymlx: mlx-vlm not installed — installing (one-time)…"
+      if uv tool install mlx-vlm --with jinja2 >/dev/null 2>&1 \
+         && command -v mlx_vlm.server >/dev/null 2>&1; then
+        print -u2 "ymlx: mlx-vlm installed."
+        missing=()
+      fi
+    fi
+    if (( ${#missing[@]} > 0 )); then
+      print -u2 "ymlx: missing required tool(s): ${missing[*]}"
+      print -u2 ""
+      print -u2 "Install with:"
+      print -u2 "  brew install uv gum && uv tool install mlx-vlm --with jinja2"
+      return 1
+    fi
   fi
 
   mkdir -p "$state_dir" "$log_dir" "$chat_dir"
@@ -1736,6 +1751,33 @@ PY
     fi
   }
 
+  # Keep the mlx-vlm uv tool current. Interactive mode only, mirroring
+  # _ymlx_check_update so headless run/stop/status stay offline and fast; and
+  # skipped while a model server is running so an update never swaps the
+  # binary under a live process. Uses `uv tool list --outdated`, which does
+  # the index comparison itself (no manual version parsing, no sort -V, no
+  # hardcoded minimum — LFM2 support landed back in 0.3.3; 0.7.0 only added
+  # LFM2 DSpark / OptiQ loading, so "latest" is the right target).
+  _ymlx_check_mlx_vlm_update() {
+    (( $# == 0 )) || return 0
+    command -v mlx_vlm.server >/dev/null 2>&1 || return 0
+    _ymlx_running | grep -q . && return 0   # server up → defer until next start
+    local out cur new
+    out=$(uv tool list --outdated 2>/dev/null | awk '$1 == "mlx-vlm" && /latest:/ {print; exit}')
+    [[ -n "$out" ]] || return 0            # current, or offline → nothing to do
+    cur=$(print -r -- "$out" | awk '{print $2}')
+    new=$(print -r -- "$out" | sed -n 's/.*\[latest: \([^]]*\)\].*/\1/p')
+    echo
+    print -u2 "ymlx: new mlx-vlm available: $cur → $new — updating…"
+    if uv tool update mlx-vlm >/dev/null 2>&1; then
+      local now
+      now=$(uv tool list 2>/dev/null | awk '$1 == "mlx-vlm" {print $2; exit}')
+      print -u2 "ymlx: mlx-vlm updated to ${now:-latest}."
+    else
+      print -u2 "ymlx: mlx-vlm update failed — retry with: uv tool update mlx-vlm"
+    fi
+  }
+
   # Headless (non-interactive) helpers -------------------------------
   _ymlx_running_model() {  # echoes pid\tport\tmodel (or nothing)
     local line
@@ -1846,6 +1888,7 @@ PY
   if ! _ymlx_hf_has_token; then
     gum style --foreground 244 "HF Hub: unauthenticated — downloads still work but are slower. Offer a token at the first download."
   fi
+  _ymlx_check_mlx_vlm_update "$@"
 
   while true; do
     _ymlx_main_standard
