@@ -34,6 +34,15 @@ curl -fsSL https://raw.githubusercontent.com/pavsefcik/ymlx/main/install.sh | sh
 ### Standalone — Homebrew (tap)
 
 ```sh
+brew install pavsefcik/ymlx/ymlx
+```
+
+One line on any Homebrew version. Homebrew ≥ 6 auto-trusts exactly this
+formula on a fully-qualified install, so there's no separate tap/trust step.
+For the shorter `ymlx` name (tapped + trusted):
+
+```sh
+brew trust pavsefcik/ymlx   # Homebrew 6+ only: taps are executable Ruby, so they need explicit trust
 brew tap pavsefcik/ymlx
 brew install ymlx
 ```
