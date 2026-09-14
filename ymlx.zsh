@@ -145,6 +145,7 @@ CFG
 
   _ymlx_chat_repl() {
     local model="$1" port="$2"
+    local resume="${3:-}"
     if ! command -v python3 >/dev/null 2>&1; then
       gum style --foreground 196 "python3 not found — install Xcode Command Line Tools (xcode-select --install) to use the built-in chat."
       gum input --placeholder "(press enter to continue)" >/dev/null
@@ -154,19 +155,31 @@ CFG
     local url="http://127.0.0.1:$port/v1/chat/completions"
     local sysp="$YMLX_QUICK_SYSTEM_PROMPT"
     local thinking="${YMLX_QUICK_THINKING:-default}"
-    local stamp=$(date +%Y-%m-%d_%H%M%S)
-    local safe="${model//\//_}"
-    local chat_log="$chat_dir/${stamp}_${safe}.txt"
-    {
-      echo "# Chat with $friendly on :$port"
-      echo "# Model: $model"
-      echo "# Base URL: http://localhost:$port/v1"
-      echo "# Started: $(date '+%Y-%m-%d %H:%M:%S')"
-      echo "# Thinking: $thinking"
-      echo
-    } > "$chat_log"
+    local chat_log stamp safe
+    if [[ -n "$resume" && -f "$resume" ]]; then
+      # Resume: append to the existing chat's log and seed the conversation
+      # from that log inside the python REPL (resume path is arg 8).
+      chat_log="$resume"
+      echo "# Resumed: $(date '+%Y-%m-%d %H:%M:%S')" >> "$chat_log"
+    else
+      resume=""
+      stamp=$(date +%Y-%m-%d_%H%M%S)
+      safe="${model//\//_}"
+      chat_log="$chat_dir/${stamp}_${safe}.txt"
+      {
+        echo "# Chat with $friendly on :$port"
+        echo "# Model: $model"
+        echo "# Base URL: http://localhost:$port/v1"
+        echo "# Started: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# Thinking: $thinking"
+        echo
+      } > "$chat_log"
+    fi
     echo
     gum style --foreground 212 --bold "Chatting with $friendly on :$port"
+    if [[ -n "$resume" ]]; then
+      echo "  (resuming an existing conversation — new messages append to its log)"
+    fi
     echo "  Base URL:   http://localhost:$port/v1"
     echo "  Model:      $model"
     echo "  Commands:   /reset clears history • /exit or Ctrl-D to leave"
@@ -194,6 +207,26 @@ else:
 
 base = ([{"role":"system","content":sysp}] if sysp else [])
 messages = list(base)
+
+# Resume: when a previous chat log is provided, seed the conversation from it.
+# Lines are `you> …` / `assistant> …`; `(history cleared)` resets context.
+resume = sys.argv[8] if len(sys.argv) > 8 else ""
+if resume:
+    try:
+        with open(resume) as _rf:
+            for _rl in _rf:
+                _rl = _rl.rstrip("\n")
+                if _rl.startswith("you> "):
+                    messages.append({"role": "user", "content": _rl[5:]})
+                elif _rl.startswith("assistant> "):
+                    _c = _rl[11:]
+                    if _c.endswith(" [stopped]"):
+                        _c = _c[:-10]
+                    messages.append({"role": "assistant", "content": _c})
+                elif _rl == "(history cleared)":
+                    messages = list(base)
+    except OSError:
+        pass
 
 OPEN = re.compile(r' thinking|\[THINK\]', re.IGNORECASE)
 CLOSE = re.compile(r' response|\[/THINK\]', re.IGNORECASE)
@@ -460,7 +493,7 @@ finally:
     termios.tcsetattr(FD, termios.TCSANOW, old_term)
 
 PY
-)" "$url" "$model" "$sysp" "$thinking" "$chat_log" "$YMLX_QUICK_TEMP" "$YMLX_QUICK_MAX_TOKENS"
+)" "$url" "$model" "$sysp" "$thinking" "$chat_log" "$YMLX_QUICK_TEMP" "$YMLX_QUICK_MAX_TOKENS" "$resume"
   }
 
   _ymlx_apply_quick() {
@@ -552,10 +585,10 @@ PY
         "Temperature:    $cur_temp"
         "Max tokens:     $cur_max"
         "System prompt:  $cur_sys"
-        "Back"
+        "Back to Top"
       )
-      local choice=$(printf "%s\n" "${settings_entries[@]}" | gum choose --header $'\nBasic settings (current values shown):' --height 14)
-      [[ -z "$choice" || "$choice" == "Back" ]] && return
+      local choice=$(printf "%s\n" "${settings_entries[@]}" | gum choose --header $'\nBasic settings (current values shown):  esc = back' --height 14)
+      [[ -z "$choice" || "$choice" == "Back to Top" ]] && return
       case "$choice" in
         "Thinking:"*)
           local pick=$(printf "default\non\noff" | gum choose --header "Enable thinking?")
@@ -604,6 +637,10 @@ PY
 
   _ymlx_open_models_folder() {
     open "$hub_dir"
+  }
+
+  _ymlx_open_chat_folder() {
+    open "$chat_dir"
   }
 
   _ymlx_main_restart() {
@@ -918,42 +955,334 @@ _ymlx_running() {
   }
 
   _ymlx_chat_history_menu() {
-    while true; do
-      local -a hist_entries=()
-      typeset -A hist_files
-      local f friendly started label
+    # Key-driven menu mirroring the main menu. enter = per-chat actions,
+    # ^d deletes the highlighted chat, s = search, o = open chat folder,
+    # esc/^q = back to main menu.
+    local -a _H_LINES=() _H_FILES=()
+    local _H_CURSOR=0 _H_SCROLL=0 _H_DRAWN=0 _H_NLINES=0 _H_VIS _H_WIDTH
+    local _H_QUIT=0
+    local _up1=$'\e'[A _up2=$'\e'OA _down1=$'\e'[B _down2=$'\e'OB
+    local _term_lines=${LINES:-24}
+    (( _term_lines < 8 )) && _term_lines=24
+    _H_VIS=$(( _term_lines - 7 ))
+    (( _H_VIS < 1 )) && _H_VIS=1
+    _H_WIDTH=${COLUMNS:-80}
+    (( _H_WIDTH < 40 )) && _H_WIDTH=80
+
+    _H_name_of() {
+      local f="$1" n
+      n=$(sed -n 's/^# Name: //p' "$f" | head -n1)
+      [[ -z "$n" ]] && n=$(sed -n 's/^# Chat with //p' "$f" | head -n1 | sed 's/ on :[0-9]*$//')
+      [[ -z "$n" ]] && n="${f:t:r}"
+      print -r -- "$n"
+    }
+
+    _H_build() {
+      local f friendly started msgs kbytes
       local -a chat_files=( "$chat_dir"/*.txt(N) )
       local -a sorted_files=( ${(On)chat_files} )
+      _H_LINES=(); _H_FILES=()
       for f in "${sorted_files[@]}"; do
-        friendly=$(sed -n 's/^# Chat with //p' "$f" | head -n1 | sed 's/ on :[0-9]*$//')
+        friendly=$(_H_name_of "$f")
         started=$(sed -n 's/^# Started: //p' "$f" | head -n1)
-        [[ -z "$friendly" ]] && friendly="${f:t}"
         [[ -z "$started" ]] && started="${f:t:r}"
-        label="$friendly  —  $started"
-        hist_entries+=("$label")
-        hist_files[$label]="$f"
+        msgs=$(grep -cE '^(you|assistant)> ' "$f")
+        kbytes=$(awk '{s+=length($0)+1} END{printf "%.0f", s/1024}' "$f")
+        (( kbytes < 1 )) && kbytes=1
+        _H_LINES+=("$friendly  —  $started  · $msgs msgs · ${kbytes}KB")
+        _H_FILES+=("$f")
       done
-      if (( ${#hist_entries[@]} == 0 )); then
-        hist_entries+=("No chats yet.")
+      if (( ${#_H_LINES[@]} == 0 )); then
+        _H_LINES+=("No chats yet.")
       fi
-      hist_entries+=("──────────────" "Clear history" "Back to Top")
-      local pick=$(printf "%s\n" "${hist_entries[@]}" | gum choose --header $'\nChat History:' --height 20)
-      [[ -z "$pick" ]] && return
-      if [[ "$pick" == "Back to Top" || "$pick" == *──* || "$pick" == "No chats yet." ]]; then
+      _H_LINES+=("──────────────" "Clear history")
+      _H_LINES+=("Open chat folder" "Back to Top")
+      (( _H_CURSOR >= ${#_H_LINES[@]} )) && _H_CURSOR=$(( ${#_H_LINES[@]} - 1 ))
+      (( _H_CURSOR < 0 )) && _H_CURSOR=0
+      _H_scroll_cursor
+    }
+
+    _H_scroll_cursor() {
+      local n=${#_H_LINES[@]} max=$(( n - _H_VIS ))
+      (( max < 0 )) && max=0
+      (( _H_SCROLL > max )) && _H_SCROLL=$max
+      if (( _H_CURSOR < _H_SCROLL )); then
+        _H_SCROLL=$_H_CURSOR
+      elif (( _H_CURSOR >= _H_SCROLL + _H_VIS )); then
+        _H_SCROLL=$(( _H_CURSOR - _H_VIS + 1 ))
+      fi
+      (( _H_SCROLL < 0 )) && _H_SCROLL=0
+    }
+
+    _H_render() {
+      if (( _H_DRAWN )); then
+        print -n -- "\033[${_H_NLINES}A\033[J"
+      fi
+      local -a out=()
+      out+=( $'\e[1;35mChat History:\e[0m  (enter actions • esc back)' )
+      local n=${#_H_LINES[@]} end=$(( _H_SCROLL + _H_VIS ))
+      (( end > n )) && end=n
+      local i idx line prefix sep
+      for (( i=_H_SCROLL; i<end; i++ )); do
+        idx=$i
+        line="${_H_LINES[$((idx+1))]}"
+        sep=0
+        [[ "$line" == "──────────────" ]] && sep=1
+        prefix="  "
+        (( idx == _H_CURSOR )) && prefix="> "
+        if (( sep )); then
+          out+=( $'\e[2m'"$line"$'\e[0m' )
+        elif (( idx == _H_CURSOR )); then
+          out+=( $'\e[1;36m'"$prefix$line"$'\e[0m' )
+        else
+          out+=( "$prefix$line" )
+        fi
+      done
+      local foot="↑/↓ nav • enter actions • ^d delete • s search • o chat folder • esc back"
+      out+=( $'\e[2m'"${foot:0:$(( _H_WIDTH - 1 ))}"$'\e[0m' )
+      _H_NLINES=0
+      for line in "${out[@]}"; do
+        print -n -- "$line\033[K\n"
+        (( _H_NLINES++ ))
+      done
+      _H_DRAWN=1
+    }
+
+    _H_clear() {
+      if (( _H_DRAWN )); then
+        print -n -- "\033[${_H_NLINES}A\033[J"
+        _H_DRAWN=0
+      fi
+    }
+
+    _H_move() {
+      local delta="$1" n=${#_H_LINES[@]} new=$_H_CURSOR guard=$_H_CURSOR
+      while true; do
+        new=$(( new + delta ))
+        (( new < 0 )) && new=$(( n - 1 ))
+        (( new >= n )) && new=0
+        if [[ "${_H_LINES[$((new+1))]}" != "──────────────" ]]; then
+          _H_CURSOR=$new
+          break
+        fi
+        (( new == guard )) && break
+      done
+      _H_scroll_cursor
+    }
+
+    _H_delete() {
+      local idx=$(( _H_CURSOR + 1 ))
+      local file="${_H_FILES[$idx]}"
+      [[ -n "$file" && -f "$file" ]] || return
+      _H_clear
+      if gum confirm "Delete this chat?\n${_H_LINES[$idx]}"; then
+        rm -f -- "$file"
+        echo "Deleted."
+      else
+        echo
+      fi
+      gum input --placeholder "(press enter to continue)" >/dev/null
+      _H_build; _H_render
+    }
+
+    _H_export() {
+      local file="$1" mode="${2:-}"
+      local md
+      md=$( {
+        echo "# Chat: $(_H_name_of "$file")"
+        echo
+        sed -E '/^#[[:space:]]/d; /^\(history cleared\)/d' "$file" \
+          | sed -E 's/^you> /**You:** /; s/^assistant> /**Assistant:** /'
+      } )
+      if [[ "$mode" == "copy" ]]; then
+        _H_clear
+        if printf '%s' "$md" | pbcopy 2>/dev/null; then
+          echo "Copied chat to clipboard (Markdown)."
+        else
+          echo "Clipboard copy failed (pbcopy unavailable)."
+        fi
+        gum input --placeholder "(press enter to continue)" >/dev/null
+        _H_render
         return
       fi
-      if [[ "$pick" == "Clear history" ]]; then
+      local out="$chat_dir/${file:t:r}.md"
+      _H_clear
+      printf '%s\n' "$md" > "$out"
+      echo "Exported to: $out"
+      if gum confirm "Open the exported file?"; then
+        open "$out" 2>/dev/null
+      fi
+      gum input --placeholder "(press enter to continue)" >/dev/null
+      _H_render
+    }
+
+    _H_rename() {
+      local file="$1" cur new
+      cur=$(_H_name_of "$file")
+      _H_clear
+      new=$(gum input --placeholder "New name for this chat" --value "$cur")
+      if [[ -n "$new" ]]; then
+        python3 - "$file" "$new" <<'PY'
+import sys
+f, nn = sys.argv[1], sys.argv[2]
+lines = open(f).read().splitlines()
+out, done = [], False
+for ln in lines:
+    if ln.startswith("# Name: "):
+        out.append("# Name: " + nn); done = True; continue
+    if not done and ln.startswith("# Chat with "):
+        out.append("# Name: " + nn); done = True
+    out.append(ln)
+if not done:
+    out.insert(0, "# Name: " + nn)
+open(f, "w").write("\n".join(out) + "\n")
+PY
+        echo "Renamed chat."
+      fi
+      gum input --placeholder "(press enter to continue)" >/dev/null
+    }
+
+    _H_resume() {
+      local idx=$(( _H_CURSOR + 1 ))
+      local file="${_H_FILES[$idx]}"
+      [[ -n "$file" && -f "$file" ]] || return
+      local model=$(sed -n 's/^# Model: //p' "$file" | head -n1)
+      if [[ -z "$model" ]]; then
+        _H_clear
+        gum style --foreground 196 "Can't determine the model for this chat (missing '# Model:' header)."
+        gum input --placeholder "(press enter to continue)" >/dev/null
+        _H_render
+        return
+      fi
+      local port="" pid _p _pt _m
+      while IFS=$'\t' read -r _p _pt _m; do
+        [[ "$_m" == "$model" ]] && { port="$_pt"; break; }
+      done < <(_ymlx_running)
+      _H_clear
+      if [[ -z "$port" ]]; then
+        gum style --foreground 212 --bold "Continuing chat: $(_ymlx_display_name "$model")"
+        echo "The model isn't running — starting it first, then resuming the conversation."
+        if ! _ymlx_launch "$model"; then
+          gum input --placeholder "(press enter to continue)" >/dev/null
+          _H_render
+          return
+        fi
+        port=11500
+      fi
+      _ymlx_chat_repl "$model" "$port" "$file"
+      _H_render
+    }
+
+    _H_search() {
+      _H_clear
+      local q=$(gum input --placeholder "Search chats (case-insensitive, regex ok)…")
+      if [[ -z "$q" ]]; then
+        _H_render
+        return
+      fi
+      local -a results=() rfiles=() rlines=()
+      local f friendly ln ctx hit
+      for f in "$chat_dir"/*.txt(N); do
+        friendly=$(_H_name_of "$f")
+        while IFS= read -r hit; do
+          ln="${hit%%:*}"
+          ctx="${hit#*:}"
+          results+=("$friendly  @$ln  —  $ctx")
+          rfiles+=("$f"); rlines+=("$ln")
+        done < <(grep -n -i -E -- "$q" "$f" 2>/dev/null)
+      done
+      if (( ${#results[@]} == 0 )); then
+        echo "No matches for: $q"
+        gum input --placeholder "(press enter to continue)" >/dev/null
+        _H_render
+        return
+      fi
+      local pick=$(printf "%s\n" "${results[@]}" | gum choose --header "Search results for: $q" --height 16)
+      if [[ -n "$pick" ]]; then
+        local j
+        for (( j=1; j<=${#results[@]}; j++ )); do
+          [[ "${results[$j]}" == "$pick" ]] && { gum pager < "${rfiles[$j]}"; break; }
+        done
+      fi
+      _H_render
+    }
+
+    _H_activate() {
+      local idx=$(( _H_CURSOR + 1 ))
+      local line="${_H_LINES[$idx]}" file="${_H_FILES[$idx]}"
+      if [[ "$line" == "Clear history" ]]; then
+        _H_clear
         if gum confirm "Delete all chat history?"; then
           rm -f "$chat_dir"/*.txt(N)
           echo "Chat history cleared."
+        else
+          echo
         fi
-        continue
+        gum input --placeholder "(press enter to continue)" >/dev/null
+        _H_build; _H_render
+        return
       fi
-      local file="${hist_files[$pick]}"
-      [[ -n "$file" && -f "$file" ]] && gum pager < "$file"
+      if [[ "$line" == "Back to Top" ]]; then
+        _H_clear
+        _H_QUIT=1
+        return
+      fi
+      if [[ "$line" == "Open chat folder" ]]; then
+        _H_clear; _ymlx_open_chat_folder; _H_render
+        return
+      fi
+      if [[ "$line" == "No chats yet." ]]; then
+        return
+      fi
+      [[ -n "$file" && -f "$file" ]] || return
+      local act=$(printf "View\nResume this chat\nCopy to clipboard\nRename\nDelete permanently\nCancel" | gum choose --header "$(_H_name_of "$file")" --height 10)
+      [[ -z "$act" || "$act" == "Cancel" ]] && { _H_render; return; }
+      case "$act" in
+        "View") _H_clear; gum pager < "$file"; _H_render ;;
+        "Resume this chat") _H_resume ;;
+        "Copy to clipboard") _H_export "$file" copy ;;
+        "Rename") _H_rename "$file"; _H_build; _H_render ;;
+        "Delete permanently")
+          _H_clear
+          if gum confirm "Permanently delete this chat? (no undo)"; then
+            rm -f -- "$file"; echo "Deleted permanently."
+          else
+            echo
+          fi
+          gum input --placeholder "(press enter to continue)" >/dev/null
+          _H_build; _H_render
+          ;;
+      esac
+    }
+
+    stty -ixon 2>/dev/null
+    _H_build
+    _H_render
+    while true; do
+      _ymlx_main_read_key
+      local key="$_YMLX_MENU_KEY"
+      if [[ "$key" == "$_up1" || "$key" == "$_up2" ]]; then
+        _H_move -1; _H_render
+      elif [[ "$key" == "$_down1" || "$key" == "$_down2" ]]; then
+        _H_move 1; _H_render
+      elif [[ "$key" == $'\n' || "$key" == $'\r' ]]; then
+        _H_activate
+        if (( _H_QUIT )); then
+          _H_clear
+          return
+        fi
+      elif [[ "$key" == $'\x04' ]]; then
+        _H_delete
+      elif [[ "$key" == "s" || "$key" == "S" || "$key" == "/" ]]; then
+        _H_search
+      elif [[ "$key" == "o" || "$key" == "O" ]]; then
+        _H_clear; _ymlx_open_chat_folder; _H_render
+      elif [[ "$key" == $'\x11' || "$key" == $'\e' || -z "$key" ]]; then
+        _H_clear
+        return
+      fi
     done
   }
-
   _ymlx_main_build() {
     local pid port model models m friendly rport think_suffix display first_running_idx=-1
     _YMLX_MENU_LINES=()
@@ -1064,9 +1393,9 @@ _ymlx_running() {
     done
     local footer_text
     if (( has_running )); then
-      footer_text="↓↑ navigate • enter submit/start • tab toggle thinking • ^s stop server • ^d delete • esc back • ^q quit"
+      footer_text="↓↑ navigate • enter submit/start • tab toggle thinking • ^s stop server • ^d delete • ^q quit"
     else
-      footer_text="↓↑ navigate • enter submit/start • ^d delete • esc back • ^q quit"
+      footer_text="↓↑ navigate • enter submit/start • ^d delete • ^q quit"
     fi
     footer_text="${footer_text:0:$(( _YMLX_MENU_WIDTH - 1 ))}"
     out+=( $'\e[2m'"$footer_text"$'\e[0m' )

@@ -55,6 +55,12 @@ ymlx
 
 - One model at a time on `:11500` — Enter starts it and drops straight into chat
 - `tab` toggles thinking per request · `esc` stops generation · `^s` stops server
+- **Chat history** records every chat; open it from the menu and **enter** a chat
+  for actions: resume (continue the thread), copy to clipboard, rename, or
+  delete permanently. `^d` deletes the highlighted chat at a keystroke; `esc`
+  returns. `s` or
+  `/` searches across all chats, `o` opens the chat folder. Deleted chats are
+  gone for good (no trash).
 - Download from a curated list ([ymlx-curator](https://github.com/pavsefcik/ymlx-curator),
   filtered to your RAM tier) or paste any HuggingFace id
 - Drop-in OpenAI endpoint for other apps — from the **Use from another app**
