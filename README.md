@@ -74,6 +74,10 @@ ymlx
   gone for good (no trash).
 - Download from a curated list ([ymlx-curator](https://github.com/pavsefcik/ymlx-curator),
   filtered to your RAM tier) or paste any HuggingFace id
+- Ministral models are shipped as Instruct+Reasoning pairs: downloading a
+  Ministral entry fetches both halves, the menu shows a single
+  `Ministral-3-xB-4bit` entry, and `tab` swaps between the Instruct and
+  Reasoning version (never both at once)
 - Drop-in OpenAI endpoint for other apps — from the **Use from another app**
   screen: base URL `http://localhost:11500/v1`, model = HF id of the running
   model, API key not required
@@ -92,4 +96,4 @@ ymlx checks GitHub for a newer version at every launch; when one exists a
 **Update to latest version** entry that pulls and reinstalls in place (a
 pi-managed install instead guides you to `pi update`; a curl/managed copy is
 refreshed from GitHub automatically). Installed version lives
-in the repo-root `VERSION` file (semver, currently 0.2.0).
+in the repo-root `VERSION` file (semver, currently 0.11.0).

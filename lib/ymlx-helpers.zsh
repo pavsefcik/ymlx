@@ -92,3 +92,24 @@ _ymlx_friendly_name() {
 _ymlx_display_name() {
   _ymlx_friendly_name "$1"
 }
+
+# Ministral ships as an Instruct+Reasoning pair (two separate model ids).
+# If $1 is one half of a pair, echo the sibling full id and return 0;
+# otherwise return 1.
+_ymlx_ministral_sibling() {
+  local m="$1" base="${1##*/}" sib
+  if [[ "$base" == *-Instruct-* ]]; then
+    sib="${base/-Instruct-/-Reasoning-}"
+  elif [[ "$base" == *-Reasoning-* ]]; then
+    sib="${base/-Reasoning-/-Instruct-}"
+  else
+    return 1
+  fi
+  print -r -- "${m%/*}/$sib"
+}
+
+# Base display name for a Ministral half, e.g.
+#   mlx-community/Ministral-3-3B-Instruct-2512-4bit -> Ministral-3-3B-4bit
+_ymlx_ministral_base() {
+  print -r -- "$(print -r -- "${1##*/}" | sed -E 's/-([Ii]nstruct|[Rr]easoning)-[^-]+-/-/')"
+}

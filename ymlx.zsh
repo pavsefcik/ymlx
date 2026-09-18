@@ -152,6 +152,7 @@ CFG
   typeset -ga _YMLX_MENU_MODELS=()
   typeset -ga _YMLX_MENU_PORTS=()
   typeset -ga _YMLX_MENU_ACTIONS=()
+  typeset -ga _YMLX_MENU_PAIRS=()
   typeset -gi _YMLX_MENU_CURSOR=0
   typeset -gi _YMLX_MENU_SCROLL=0
   typeset -gi _YMLX_MENU_VIS=10
@@ -187,40 +188,65 @@ CFG
       _ymlx_pause
       return 1
     fi
-    local friendly=$(_ymlx_display_name "$model")
-    local url="http://127.0.0.1:$port/v1/chat/completions"
     local sysp="$YMLX_QUICK_SYSTEM_PROMPT"
-    local thinking="${YMLX_QUICK_THINKING:-default}"
-    local chat_log stamp safe
-    if [[ -n "$resume" && -f "$resume" ]]; then
-      # Resume: append to the existing chat's log and seed the conversation
-      # from that log inside the python REPL (resume path is arg 8).
-      chat_log="$resume"
-      echo "# Resumed: $(date '+%Y-%m-%d %H:%M:%S')" >> "$chat_log"
-    else
-      resume=""
-      stamp=$(date +%Y-%m-%d_%H%M%S)
-      safe="${model//\//_}"
-      chat_log="$chat_dir/${stamp}_${safe}.txt"
-      {
-        echo "# Chat with $friendly on :$port"
-        echo "# Model: $model"
-        echo "# Base URL: http://localhost:$port/v1"
-        echo "# Started: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "# Thinking: $thinking"
-        echo
-      } > "$chat_log"
-    fi
-    echo
-    gum style --foreground 212 --bold "Chatting with $friendly on :$port"
-    if [[ -n "$resume" ]]; then
-      echo "  (resuming an existing conversation — new messages append to its log)"
-    fi
-    echo "  Base URL:   http://localhost:$port/v1"
-    echo "  Model:      $model"
-    echo "  Commands:   /reset clears history • /exit or Ctrl-D to leave"
-    echo "  Thinking:   $thinking • tab toggle thinking • esc stops output"
-    echo
+    local rc ministral_other co chat_log url friendly
+    while true; do
+      sysp="$YMLX_QUICK_SYSTEM_PROMPT"
+      url="http://127.0.0.1:$port/v1/chat/completions"
+      friendly=$(_ymlx_display_name "$model")
+      local thinking="${YMLX_QUICK_THINKING:-default}"
+      local stamp safe
+      # If chatting one half of a Ministral pair (Instruct or Reasoning), tab
+      # swaps to the sibling — tell the REPL so it can raise exit-3 to request
+      # the swap.
+      ministral_other=""
+      if [[ "${model##*/}" == *-Instruct-* || "${model##*/}" == *-Reasoning-* ]]; then
+        co=$(_ymlx_ministral_sibling "$model")
+        [[ -d "$hub_dir/models--${co//\//--}" ]] && ministral_other="$co"
+      fi
+      # The banner's "Thinking:" reflects the model variant: a Reasoning pair
+      # half is inherently "on", an Instruct half "off". YMLX_QUICK_THINKING
+      # still drives the enable_thinking request override sent to the REPL.
+      local is_reasoning=0 thinking_disp="$thinking"
+      if [[ "${model##*/}" == *-Reasoning-* ]]; then
+        is_reasoning=1
+        thinking_disp="on"
+      elif [[ "${model##*/}" == *-Instruct-* ]]; then
+        thinking_disp="off"
+      fi
+      if [[ -n "$resume" && -f "$resume" ]]; then
+        # Resume: append to the existing chat's log and seed the conversation
+        # from that log inside the python REPL (resume path is arg 8).
+        chat_log="$resume"
+        echo "# Resumed: $(date '+%Y-%m-%d %H:%M:%S')" >> "$chat_log"
+      else
+        resume=""
+        stamp=$(date +%Y-%m-%d_%H%M%S)
+        safe="${model//\//_}"
+        chat_log="$chat_dir/${stamp}_${safe}.txt"
+        {
+          echo "# Chat with $friendly on :$port"
+          echo "# Model: $model"
+          echo "# Base URL: http://localhost:$port/v1"
+          echo "# Started: $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "# Thinking: $thinking_disp"
+          echo
+        } > "$chat_log"
+      fi
+      echo
+      gum style --foreground 212 --bold "Chatting with $friendly on :$port"
+      if [[ -n "$resume" ]]; then
+        echo "  (resuming an existing conversation — new messages append to its log)"
+      fi
+      echo "  Base URL:   http://localhost:$port/v1"
+echo "  Model:      $model"
+      echo "  Commands:   /reset clears history • /exit or Ctrl-D to leave"
+      if [[ -n "$ministral_other" ]]; then
+        echo "  Thinking:   $thinking_disp • tab swaps instruct↔reasoning"
+      else
+        echo "  Thinking:   $thinking_disp • tab toggle thinking"
+      fi
+      echo
 python3 -c "$(cat <<'PY'
 import sys, json, re, signal, termios, tty, select, os, codecs, urllib.request, urllib.error
 
@@ -230,6 +256,13 @@ thinking = sys.argv[4] if len(sys.argv) > 4 else "default"
 log_path = sys.argv[5] if len(sys.argv) > 5 else ""
 temp = sys.argv[6] if len(sys.argv) > 6 else ""
 max_tokens = sys.argv[7] if len(sys.argv) > 7 else ""
+# When chatting one half of a Ministral pair, tab drops us back to the shell
+# (exit 3) so it can swap to the sibling variant (Instruct <-> Reasoning).
+ministral_other = sys.argv[9] if len(sys.argv) > 9 else ""
+# True when the chat model is a Reasoning-variant half of a Ministral pair.
+# Such models always emit a thinking block, so the REPL knows to treat
+# everything up to the closing token as thinking (no opener is required).
+is_reasoning = len(sys.argv) > 10 and sys.argv[10] == "1"
 
 # thinking: "default" | "on" | "off". enable_thinking is the per-request
 # override mlx_vlm.server reads as the top-level "enable_thinking" field;
@@ -266,6 +299,12 @@ if resume:
 
 OPEN = re.compile(r' thinking|\[THINK\]', re.IGNORECASE)
 CLOSE = re.compile(r' response|\[/THINK\]', re.IGNORECASE)
+# Explicit Ministral tags. For reasoning models the thinking is delimited by
+# [THINK]…[/THINK]; the loose " thinking"/" response" words must NOT be used
+# as the close for Ministral, or a bare " response" inside the reasoning would
+# truncate it prematurely. We close strictly on the explicit [\/THINK] tag.
+ROPEN  = re.compile(r'\s*\[THINK\]', re.IGNORECASE)
+RCLOSE = re.compile(r'\[/THINK\]', re.IGNORECASE)
 TAIL = 10  # max bytes to hold back in case a tag straddles chunks
 GRAY = "\033[2m"
 RESET = "\033[0m"
@@ -274,11 +313,59 @@ decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
 class Filter:
     # mode "show" renders thinking dim/gray; mode "strip" drops it entirely.
-    def __init__(self, mode):
+    #
+    # A reasoning model's thinking can reach the client two ways, depending on
+    # the server/template:
+    #   * external — streamed in the separate reasoning_content field, leaving
+    #     content as the clean answer; or
+    #   * inline — embedded in content as [THINK]…[/THINK].
+    # This filter handles both. Inline closing is done strictly on [/THINK] so
+    # a " response" word inside the reasoning never cuts the block short, and
+    # the whole trace from the start is kept grey before the switch to white.
+    def __init__(self, mode, reasoning=False):
         self.mode = mode
-        self.in_think = False
+        self.reasoning = reasoning
+        self.external = False   # reasoning arrives via reasoning_content
+        self.done = not reasoning   # reasoning: thinking block comes first
+        self.in_think = False   # generic (Qwen-style) open/close limiters
         self.buf = ""
-    def feed(self, text):
+    def external_reasoning(self, text):
+        # Server routed the trace to reasoning_content; content is the answer.
+        body = (self.buf + text) if self.buf else text   # merge any inline tail
+        self.buf = ""
+        self.external = True
+        self.done = True
+        self.in_think = False
+        return (GRAY + body + RESET) if self.mode == "show" else ""
+    def feed_content(self, text):
+        if not self.reasoning:
+            return self._feed_open_close(text)
+        if self.external:
+            return text      # clean answer; reasoning already rendered grey
+        self.buf += text
+        return self._feed_inline()
+    def _feed_inline(self):
+        # Drop a single leading explicit opener so display starts clean.
+        m0 = ROPEN.match(self.buf)
+        if m0:
+            self.buf = self.buf[m0.end():]
+        out = []
+        while True:
+            if self.done:
+                if len(self.buf) > TAIL:
+                    out.append(self.buf[:-TAIL])
+                    self.buf = self.buf[-TAIL:]
+                break
+            m = RCLOSE.search(self.buf)
+            if not m:
+                break
+            if self.mode == "show":
+                out.append(GRAY + self.buf[:m.start()] + RESET)
+            self.buf = self.buf[m.end():]
+            self.done = True
+        return "".join(out)
+    def _feed_open_close(self, text):
+        # generic (non-ministral) models: alternate " thinking" / " response".
         self.buf += text
         out = []
         while True:
@@ -303,6 +390,12 @@ class Filter:
                     break
         return "".join(out)
     def flush(self):
+        if self.reasoning:
+            rest, self.buf = self.buf, ""
+            if not self.done:
+                # never closed — whatever remains is still thinking.
+                return (GRAY + rest + RESET) if self.mode == "show" else ""
+            return rest
         if self.in_think:
             out = (GRAY + self.buf + RESET) if self.mode == "show" else ""
             self.buf = ""
@@ -311,7 +404,7 @@ class Filter:
         rest, self.buf = self.buf, ""
         return rest
 
-flt = Filter("strip" if enable_thinking is False else "show")
+flt = Filter("strip" if enable_thinking is False else "show", reasoning=is_reasoning)
 PROMPT = "\033[1;36myou>\033[0m "
 
 # Raised on a lone Esc while NOT mid-answer. Esc during an answer stops the
@@ -425,6 +518,13 @@ def input_line():
                 sys.stdout.flush()
             continue
         if b == "\t":
+            if ministral_other:
+                if is_reasoning:
+                    sys.stdout.write("\r\n\033[2mSwitching to the instruct version…\033[0m\r\n")
+                else:
+                    sys.stdout.write("\r\n\033[2mSwitching to the reasoning (thinking) version…\033[0m\r\n")
+                sys.stdout.flush()
+                sys.exit(3)
             toggle_thinking()
             sys.stdout.write(PROMPT + buf)
             sys.stdout.flush()
@@ -496,10 +596,23 @@ try:
                         break
                     try:
                         chunk = json.loads(data)
-                        delta = chunk["choices"][0]["delta"].get("content","")
-                        if delta:
-                            full += delta
-                            shown = flt.feed(delta)
+                        d = chunk["choices"][0]["delta"]
+                        # Server may route reasoning to a separate
+                        # reasoning_content field (Qwen-style) OR leave it
+                        # inline in content (Ministral). Route both so the
+                        # trace always shows in grey.
+                        rc = d.get("reasoning_content") or d.get("reasoning") or ""
+                        ct = d.get("content") or ""
+                        if rc:
+                            full += rc
+                            shown = flt.external_reasoning(rc)
+                            if shown:
+                                visible += shown
+                                sys.stdout.write(shown.replace("\n", "\r\n"))
+                                sys.stdout.flush()
+                        if ct:
+                            full += ct
+                            shown = flt.feed_content(ct)
                             if shown:
                                 visible += shown
                                 sys.stdout.write(shown.replace("\n", "\r\n"))
@@ -538,7 +651,21 @@ finally:
     termios.tcsetattr(FD, termios.TCSANOW, old_term)
 
 PY
-)" "$url" "$model" "$sysp" "$thinking" "$chat_log" "$YMLX_QUICK_TEMP" "$YMLX_QUICK_MAX_TOKENS" "$resume"
+)" "$url" "$model" "$sysp" "$thinking" "$chat_log" "$YMLX_QUICK_TEMP" "$YMLX_QUICK_MAX_TOKENS" "$resume" "$ministral_other" "$is_reasoning"
+      rc=$?
+      if (( rc != 3 )); then
+        return $rc
+      fi
+      # Ministral pair — tab requested the sibling variant.
+      if [[ -z "$ministral_other" ]]; then
+        return 3   # safety: shouldn't happen
+      fi
+      print -r -- "$ministral_other" > "$state_dir/ministral-default"
+      _ymlx_ministral_swap_to "$ministral_other" || return 1
+      model="$ministral_other"
+      port=11500
+      resume=""
+    done
   }
 
   _ymlx_apply_quick() {
@@ -686,6 +813,20 @@ PY
 
   _ymlx_open_chat_folder() {
     open "$chat_dir"
+  }
+
+  # Swap the running model to a Ministral counterpart: stop whatever is up
+  # (only one model runs at a time on :11500), wait for the port to free, then
+  # launch the requested one. Returns 0 if the new server came up.
+  _ymlx_ministral_swap_to() {
+    local new="$1"
+    _ymlx_stop_all >/dev/null 2>&1
+    local i
+    for i in {1..40}; do
+      _ymlx_port_free 11500 && break
+      sleep 0.2
+    done
+    _ymlx_launch "$new"
   }
 
   _ymlx_main_restart() {
@@ -896,19 +1037,34 @@ _ymlx_running() {
     # highlighted entries is used as the description shown under the model.
     # Tier headers are any line containing "GB RAM".
     typeset -A tier_header
-    local -a p_src=() p_tags=() p_desc=() p_tier=() p_dim=()
+    local -a p_title=() p_sub=() p_tags=() p_desc=() p_tier=()
     local line current_tier=0 header num
     if [[ -r "$curated_file" ]]; then
       local -a entry=()
       _D_flush() {
         ((${#entry[@]})) || return
-        local src="${entry[1]}" tags="${entry[2]:-}" desc="${entry[3]:-}"
+        local a="${entry[1]}" b="${entry[2]:-}" c="${entry[3]:-}"
         entry=()
-        [[ -n "$src" ]] || return
+        [[ -n "$a" ]] || return
         (( current_tier == tier_active )) || return
-        [[ -z "${installed[$src]}" ]] || return
-        p_src+=( "$src" ); p_tags+=( "$tags" ); p_desc+=( "$desc" )
-        p_tier+=( "$current_tier" ); p_dim+=( 0 )
+        local title="" sub="" tags="" desc=""
+        if [[ "$a" == */* ]]; then
+          # legacy 2/3-line block: model id, tags, optional desc
+          sub="$a"; tags="$b"; desc="$c"
+        else
+          # current 3-line block: title (+flag), model id(s), tags
+          title="$a"; sub="$b"; tags="$c"
+        fi
+        # Hide the block only if every model in it is already installed. A
+        # Ministral pair (id & id2) hides once BOTH are present.
+        local -a dl=( ${(s: & :)sub} ) m
+        local allinst=1
+        for m in "${dl[@]}"; do
+          [[ -n "${installed[$m]}" ]] || { allinst=0; break; }
+        done
+        (( allinst )) && return
+        p_title+=( "$title" ); p_sub+=( "$sub" ); p_tags+=( "$tags" )
+        p_desc+=( "$desc" ); p_tier+=( "$current_tier" )
       }
       while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ -z "$line" ]]; then
@@ -932,45 +1088,50 @@ _ymlx_running() {
       _D_flush
     fi
 
-    # Deduplicate by model id, keeping the first occurrence (the highlighted
-    # entry with a description when one also appears commented in the catalog).
+    # Deduplicate by the model/sub line, keeping the first occurrence.
     typeset -A seen
-    local -a srcs=() tags=() descs=() tiers=() dims=()
+    local -a srcs=() tags=() descs=() tiers=() titles=()
     local i s
-    for (( i=1; i<=${#p_src[@]}; i++ )); do
-      s="${p_src[$i]}"
+    for (( i=1; i<=${#p_sub[@]}; i++ )); do
+      s="${p_sub[$i]}"
       [[ -n "${seen[$s]}" ]] && continue
       seen[$s]=1
+      titles+=( "${p_title[$i]}" )
       srcs+=( "$s" ); tags+=( "${p_tags[$i]}" ); descs+=( "${p_desc[$i]}" )
-      tiers+=( "${p_tier[$i]}" ); dims+=( "${p_dim[$i]}" )
+      tiers+=( "${p_tier[$i]}" )
     done
 
     # ---- Build flat rows for the menu. Cursor/nav only lands on rows with
     # RCUR=1; RDIM records rows that render dimmed when not under the cursor.
     local dim_on=$'\e[2m' dim_off=$'\e[0m'
-    local max_w=12 fw friendly tline
+    local title tline max_w=0
     for (( i=1; i<=${#srcs[@]}; i++ )); do
-      fw=${#${srcs[$i]##*/}}
-      (( fw > max_w )) && max_w=$fw
+      title="${titles[$i]}"
+      [[ -n "$title" ]] || title="${srcs[$i]##*/}"
+      (( ${#title} > max_w )) && max_w=${#title}
     done
-    local -a ROWS=() RCUR=() RSRC=() RDIM=()
+    (( max_w < 12 )) && max_w=12
+    local -a ROWS=() RCUR=() RSRC=() RTITLE=() RDIM=()
     for (( i=1; i<=${#srcs[@]}; i++ )); do
-      friendly="${srcs[$i]##*/}"
-      tline=$(printf '    %-*s  // %s' "$max_w" "$friendly" "${tags[$i]}")
+      # Show the curated title (+flag); fall back to the model basename for
+      # legacy blocks that carry no title line. Left-pad titles so the
+      # '// tags' column is aligned across rows.
+      title="${titles[$i]}"
+      [[ -n "$title" ]] || title="${srcs[$i]##*/}"
+      tline=$(printf '  %-*s  // %s' "$max_w" "$title" "${tags[$i]}")
+      ROWS+=( "$tline" ); RCUR+=( 1 ); RSRC+=( "${srcs[$i]}" ); RTITLE+=( "$title" ); RDIM+=( 0 )
       if [[ -n "${descs[$i]}" ]]; then
-        ROWS+=( "$tline" ); RCUR+=( 1 ); RSRC+=( "${srcs[$i]}" ); RDIM+=( "${dims[$i]}" )
-        ROWS+=( "      ${descs[$i]}" ); RCUR+=( 0 ); RSRC+=( "" ); RDIM+=( 1 )
-      else
-        ROWS+=( "$tline" ); RCUR+=( 1 ); RSRC+=( "${srcs[$i]}" ); RDIM+=( "${dims[$i]}" )
+        ROWS+=( "    ${descs[$i]}" ); RCUR+=( 0 ); RSRC+=( "" ); RTITLE+=( "" ); RDIM+=( 1 )
       fi
     done
 
     if (( ${#srcs[@]} == 0 )); then
-      ROWS+=( "    No more hand picked models available" ); RCUR+=( 0 ); RSRC+=( "" ); RDIM+=( 1 )
+      ROWS+=( "  No more hand picked models available" ); RCUR+=( 0 ); RSRC+=( "" ); RTITLE+=( "" ); RDIM+=( 1 )
     fi
-    ROWS+=( "    ──────────────────────────────────────────" ); RCUR+=( 0 ); RSRC+=( "" ); RDIM+=( 1 )
-    ROWS+=( "    Custom            (paste HuggingFace ID)…" ); RCUR+=( 1 ); RSRC+=( "__custom__" ); RDIM+=( 0 )
-    ROWS+=( "    Back to Top" ); RCUR+=( 1 ); RSRC+=( "__back__" ); RDIM+=( 0 )
+    ROWS+=( "  ──────────────────────────────────────────" ); RCUR+=( 0 ); RSRC+=( "" ); RTITLE+=( "" ); RDIM+=( 1 )
+    ROWS+=( "  Custom (paste HuggingFace ID)…" ); RCUR+=( 1 ); RSRC+=( "__custom__" ); RTITLE+=( "" ); RDIM+=( 0 )
+    ROWS+=( "  Open models folder" ); RCUR+=( 1 ); RSRC+=( "__openhub__" ); RTITLE+=( "" ); RDIM+=( 0 )
+    ROWS+=( "  Back to Top" ); RCUR+=( 1 ); RSRC+=( "__back__" ); RTITLE+=( "" ); RDIM+=( 0 )
 
     # If any "t3" shorthand is shown, explain it on the bottom line.
     local has_t3=0
@@ -1055,22 +1216,30 @@ _ymlx_running() {
       _D_scroll_cursor
     }
     _D_do_download() {
-      local model="$1"
+      local sub="$1" title="$2" model="" ok=1
+      # A Ministral block carries two ids ('instruct & reasoning'); download both.
+      local -a dl=( ${(s: & :)sub} )
       if ! _ymlx_hf_has_token && (( _YMLX_HF_SKIPPED == 0 )); then
         if ! _ymlx_hf_setup; then
           _YMLX_HF_SKIPPED=1
         fi
       fi
       echo
-      gum style --foreground 212 --bold "Downloading $model"
+      gum style --foreground 212 --bold "Downloading $title"
       echo "(progress will stream below — Ctrl-C to abort)"
       echo
-      if uvx --from mlx-vlm python3 -c "from mlx_vlm.utils import load; load('$model')"; then
+      for model in "${dl[@]}"; do
+        echo "  ▶ $model"
+        if ! uvx --from mlx-vlm python3 -c "from mlx_vlm.utils import load; load('$model')"; then
+          ok=0
+        fi
+      done
+      if (( ok )); then
         echo
-        gum style --foreground 42 "✓ Downloaded: $model"
+        gum style --foreground 42 "✓ Downloaded: $title"
         echo
-        if gum confirm "Start $model now?"; then
-          _ymlx_launch "$model"
+        if gum confirm "Start ${dl[1]} now?"; then
+          _ymlx_launch "${dl[1]}"
         fi
       else
         echo
@@ -1085,11 +1254,14 @@ _ymlx_running() {
       local src="${RSRC[$r]}" model=""
       if [[ "$src" == "__custom__" ]]; then
         model=$(gum input --placeholder "e.g. mlx-community/Ministral-3-3B-Instruct-2512-4bit" --prompt "Model: ")
-        [[ -n "$model" ]] && { _D_do_download "$model"; quit=1; }
+        [[ -n "$model" ]] && { _D_do_download "$model" "$model"; quit=1; }
       elif [[ "$src" == "__back__" ]]; then
         quit=1
+      elif [[ "$src" == "__openhub__" ]]; then
+        _D_clear
+        open "$hub_dir"
       else
-        _D_do_download "$src"
+        _D_do_download "$src" "${RTITLE[$r]}"
         quit=1
       fi
     }
@@ -1451,12 +1623,13 @@ PY
     done
   }
   _ymlx_main_build() {
-    local pid port model models m friendly rport think_suffix display first_running_idx=-1
+    local pid port model models m friendly rport think_suffix display first_running_idx=-1 sibfull
     _YMLX_MENU_LINES=()
     _YMLX_MENU_KINDS=()
     _YMLX_MENU_MODELS=()
     _YMLX_MENU_PORTS=()
     _YMLX_MENU_ACTIONS=()
+    _YMLX_MENU_PAIRS=()
     typeset -A running_for_model
     while IFS=$'\t' read -r pid port model; do
       [[ -z "$pid" ]] && continue
@@ -1467,11 +1640,11 @@ PY
     models=$(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
     if [[ -z "$models" ]]; then
       _YMLX_MENU_NO_MODELS=1
-      _YMLX_MENU_LINES=( "Download your first model" "Chat history" "Basic settings" "Advanced settings" "Open models folder" "Stop and quit" )
-      _YMLX_MENU_KINDS=( "action" "action" "action" "action" "action" "action" )
-      _YMLX_MENU_MODELS=( "" "" "" "" "" "" )
-      _YMLX_MENU_PORTS=( "" "" "" "" "" "" )
-      _YMLX_MENU_ACTIONS=( "download" "history" "basic" "advanced" "openhub" "quit" )
+      _YMLX_MENU_LINES=( "Download your first model" "──────────────────────" "Chat history" "──────────────────────" "Basic settings" "Advanced settings" "──────────────────────" "Stop & quit" )
+      _YMLX_MENU_KINDS=( "action" "separator" "action" "separator" "action" "action" "separator" "action" )
+      _YMLX_MENU_MODELS=( "" "" "" "" "" "" "" "" )
+      _YMLX_MENU_PORTS=( "" "" "" "" "" "" "" "" )
+      _YMLX_MENU_ACTIONS=( "download" "" "history" "" "basic" "advanced" "" "quit" )
       if [[ -n "$_YMLX_UPDATE_NEW" ]]; then
         _YMLX_MENU_LINES=( "Update to latest version" "${_YMLX_MENU_LINES[@]}" )
         _YMLX_MENU_KINDS=( "action" "${_YMLX_MENU_KINDS[@]}" )
@@ -1480,7 +1653,58 @@ PY
         _YMLX_MENU_PORTS=( "" "${_YMLX_MENU_PORTS[@]}" )
       fi
     else
-      for m in ${(f)models}; do
+      # Append one menu row for a collapsed Ministral Instruct+Reasoning pair.
+      # Shows the base name; only one half is active at a time (running variant
+      # wins, else the stored default, else Instruct). Never runs both.
+      _ymlx_add_ministral_row() {
+        local ins="$1" rea="$2" pref="" rp disp base
+        local active="$ins"
+        if [[ -n "${running_for_model[$rea]}" ]]; then
+          active="$rea"
+        fi
+        if [[ -z "${running_for_model[$ins]}" && -z "${running_for_model[$rea]}" ]]; then
+          pref="$(cat "$state_dir/ministral-default" 2>/dev/null)"
+          [[ "$pref" == "$rea" ]] && active="$rea"
+        fi
+        base=$(_ymlx_ministral_base "$active")
+        if [[ -n "${running_for_model[$active]}" ]]; then
+          rport="${running_for_model[$active]##*	}"
+          think_suffix=""
+          [[ "$YMLX_QUICK_THINKING" == "on" ]] && think_suffix=" thinking"
+          [[ "$YMLX_QUICK_THINKING" == "off" ]] && think_suffix=" thinking off"
+          display="● $base$think_suffix"
+          _YMLX_MENU_LINES+=( "$display" )
+          _YMLX_MENU_KINDS+=( "model" )
+          _YMLX_MENU_MODELS+=( "$active" )
+          _YMLX_MENU_PORTS+=( "$rport" )
+          _YMLX_MENU_ACTIONS+=( "" )
+          _YMLX_MENU_PAIRS+=( "$ins"$'\t'"$rea" )
+          (( first_running_idx < 0 )) && first_running_idx=$(( ${#_YMLX_MENU_LINES[@]} - 1 ))
+        else
+          _YMLX_MENU_LINES+=( "$base" )
+          _YMLX_MENU_KINDS+=( "model" )
+          _YMLX_MENU_MODELS+=( "$active" )
+          _YMLX_MENU_PORTS+=( "" )
+          _YMLX_MENU_ACTIONS+=( "" )
+          _YMLX_MENU_PAIRS+=( "$ins"$'\t'"$rea" )
+        fi
+      }
+
+      local -a downloaded=( ${(f)models} )
+      typeset -A dlset handled
+      local mm
+      for mm in "${downloaded[@]}"; do dlset[$mm]=1; done
+      for m in "${downloaded[@]}"; do
+        # Collapse a Ministral pair into a single row (handled via Instruct).
+        if [[ "${m##*/}" == *-Instruct-* ]]; then
+          sibfull=$(_ymlx_ministral_sibling "$m")
+          if [[ -n "${dlset[$sibfull]}" ]]; then
+            handled[$sibfull]=1
+            _ymlx_add_ministral_row "$m" "$sibfull"
+            continue
+          fi
+        fi
+        [[ -n "${handled[$m]}" ]] && continue
         friendly=$(_ymlx_display_name "$m")
         if [[ -n "${running_for_model[$m]}" ]]; then
           rport="${running_for_model[$m]##*	}"
@@ -1493,6 +1717,7 @@ PY
           _YMLX_MENU_MODELS+=( "$m" )
           _YMLX_MENU_PORTS+=( "$rport" )
           _YMLX_MENU_ACTIONS+=( "" )
+          _YMLX_MENU_PAIRS+=( "" )
           (( first_running_idx < 0 )) && first_running_idx=$(( ${#_YMLX_MENU_LINES[@]} - 1 ))
         else
           _YMLX_MENU_LINES+=( "$friendly" )
@@ -1500,6 +1725,7 @@ PY
           _YMLX_MENU_MODELS+=( "$m" )
           _YMLX_MENU_PORTS+=( "" )
           _YMLX_MENU_ACTIONS+=( "" )
+          _YMLX_MENU_PAIRS+=( "" )
         fi
       done
       _YMLX_MENU_LINES+=( "──────────────────────" )
@@ -1510,11 +1736,28 @@ PY
         _YMLX_MENU_KINDS+=( "action" )
         _YMLX_MENU_MODELS+=( "" ); _YMLX_MENU_PORTS+=( "" ); _YMLX_MENU_ACTIONS+=( "update" )
       fi
-      _YMLX_MENU_LINES+=( "Chat history" "Basic settings" "Advanced settings" "Open models folder" "Download new model" "Restart and refresh" "Stop and quit" )
-      _YMLX_MENU_KINDS+=( "action" "action" "action" "action" "action" "action" "action" )
-      _YMLX_MENU_MODELS+=( "" "" "" "" "" "" "" )
-      _YMLX_MENU_PORTS+=( "" "" "" "" "" "" "" )
-      _YMLX_MENU_ACTIONS+=( "history" "basic" "advanced" "openhub" "download" "restart" "quit" )
+      # Chat history group
+      _YMLX_MENU_LINES+=( "Chat history" )
+      _YMLX_MENU_KINDS+=( "action" )
+      _YMLX_MENU_MODELS+=( "" ); _YMLX_MENU_PORTS+=( "" ); _YMLX_MENU_ACTIONS+=( "history" )
+
+      # Settings group
+      _YMLX_MENU_LINES+=( "──────────────────────" )
+      _YMLX_MENU_KINDS+=( "separator" )
+      _YMLX_MENU_MODELS+=( "" ); _YMLX_MENU_PORTS+=( "" ); _YMLX_MENU_ACTIONS+=( "" )
+      _YMLX_MENU_LINES+=( "Basic settings" "Advanced settings" "Download new model" )
+      _YMLX_MENU_KINDS+=( "action" "action" "action" )
+      _YMLX_MENU_MODELS+=( "" "" "" ); _YMLX_MENU_PORTS+=( "" "" "" )
+      _YMLX_MENU_ACTIONS+=( "basic" "advanced" "download" )
+
+      # Lifecycle group
+      _YMLX_MENU_LINES+=( "──────────────────────" )
+      _YMLX_MENU_KINDS+=( "separator" )
+      _YMLX_MENU_MODELS+=( "" ); _YMLX_MENU_PORTS+=( "" ); _YMLX_MENU_ACTIONS+=( "" )
+      _YMLX_MENU_LINES+=( "Restart & refresh" "Stop & quit" )
+      _YMLX_MENU_KINDS+=( "action" "action" )
+      _YMLX_MENU_MODELS+=( "" "" ); _YMLX_MENU_PORTS+=( "" "" )
+      _YMLX_MENU_ACTIONS+=( "restart" "quit" )
     fi
     _YMLX_MENU_SCROLL=0
     if (( first_running_idx >= 0 )); then
@@ -1657,8 +1900,38 @@ PY
   }
 
   _ymlx_main_toggle_thinking() {
-    local kind="${_YMLX_MENU_KINDS[$((_YMLX_MENU_CURSOR+1))]}"
+    local idx=$(( _YMLX_MENU_CURSOR + 1 ))
+    local kind="${_YMLX_MENU_KINDS[$idx]}"
     [[ "$kind" != "model" ]] && return
+    local pair="${_YMLX_MENU_PAIRS[$idx]}"
+    if [[ -n "$pair" ]]; then
+      # Ministral: swap between the Instruct and Reasoning halves. Never run
+      # both at once — stop whichever is up and launch the other, or just flip
+      # the stored default when neither is running.
+      local ins="${pair%%$'\t'*}" rea="${pair##*$'\t'}"
+      local cur="${_YMLX_MENU_MODELS[$idx]}"
+      local other="$ins"; [[ "$cur" == "$ins" ]] && other="$rea"
+      local up="" pid port model
+      while IFS=$'\t' read -r pid port model; do
+        [[ -n "$pid" && ( "$model" == "$ins" || "$model" == "$rea" ) ]] && { up=1; kill "$pid" 2>/dev/null; _ymlx_drop "$pid"; }
+      done < <(_ymlx_running)
+      print -r -- "$other" > "$state_dir/ministral-default"
+      _ymlx_main_clear
+      if [[ -n "$up" ]]; then
+        local i
+        for i in {1..40}; do
+          _ymlx_port_free 11500 && break
+          sleep 0.2
+        done
+        echo "Switching to $(_ymlx_ministral_base "$other")…"
+        _ymlx_launch "$other"
+      else
+        echo "Ministral: next start uses $(_ymlx_ministral_base "$other")."
+      fi
+      _ymlx_pause
+      _ymlx_main_rebuild_preserving
+      return
+    fi
     if [[ "$YMLX_QUICK_THINKING" == "on" ]]; then
       YMLX_QUICK_THINKING="off"
     else
@@ -1703,26 +1976,45 @@ PY
     if [[ "$kind" != "model" ]]; then
       return
     fi
+    # A Ministral pair should be removed as a whole (both halves).
+    local pair="${_YMLX_MENU_PAIRS[$idx]}"
+    local -a del=( "$model" )
+    if [[ -n "$pair" ]]; then
+      local ins="${pair%%$'\t'*}" rea="${pair##*$'\t'}"
+      del=( "$ins" "$rea" )
+    fi
     _ymlx_main_clear
-    local folder="$hub_dir/models--${model//\//--}"
-    if [[ ! -d "$folder" ]]; then
-      echo "Folder not found: $folder"
+    local m folder pathdel=()
+    for m in "${del[@]}"; do
+      pathdel+=( "$hub_dir/models--${m//\//--}" )
+    done
+    local missing=0
+    for folder in "${pathdel[@]}"; do
+      [[ -d "$folder" ]] || missing=1
+    done
+    if (( missing )); then
+      echo "Folder not found."
       _ymlx_pause
     else
-      local warn=""
+      local warn="" name="${del[1]}"
+      [[ -n "$pair" ]] && name="${del[1]} + ${del[2]}"
       [[ -n "$port" ]] && warn=" (running server will be stopped first)"
-      if gum confirm "Remove $model from $hub_dir?$warn"; then
-        if [[ -n "$port" ]]; then
-          local pid _p _pt _m
-          while IFS=$'\t' read -r _p _pt _m; do
-            if [[ "$_m" == "$model" && "$_pt" == "$port" ]]; then
-              pid="$_p"; break
-            fi
-          done < <(_ymlx_running)
-          [[ -n "$pid" ]] && kill "$pid" 2>/dev/null && _ymlx_drop "$pid"
-        fi
-        rm -rf "$folder"
-        echo "Removed: $model"
+      if gum confirm "Remove $name from $hub_dir?$warn"; then
+        local pid _p _pt _mm skip
+        while IFS=$'\t' read -r _p _pt _mm; do
+          skip=""
+          for m in "${del[@]}"; do
+            [[ "$_mm" == "$m" ]] && { skip=1; break; }
+          done
+          if [[ -n "$_p" && -n "$skip" ]]; then
+            kill "$_p" 2>/dev/null && _ymlx_drop "$_p"
+          fi
+        done < <(_ymlx_running)
+        for folder in "${pathdel[@]}"; do
+          rm -rf "$folder"
+        done
+        rm -f "$state_dir/ministral-default"
+        echo "Removed: $name"
         _ymlx_pause
       fi
     fi
@@ -1822,7 +2114,6 @@ PY
         history) _ymlx_chat_history_menu ;;
         basic) _ymlx_basic_settings_menu ;;
         advanced) _ymlx_advanced_settings_menu ;;
-        openhub) _ymlx_open_models_folder ;;
         restart) _ymlx_main_restart ;;
         quit) _ymlx_main_quit ;;
       esac
