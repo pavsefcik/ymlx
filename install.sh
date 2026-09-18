@@ -21,6 +21,9 @@
 # Environment:
 #   YMLX_DIR   install directory when no checkout is available (default $HOME/.ymlx)
 #   YMLX_REF   git ref to fetch (default: latest release tag, else main)
+#   YMLX_FORCE re-download the source even if ymlx.zsh already exists. The in-app
+#              "Update to latest version" uses this to refresh non-git managed
+#              copies (which otherwise wouldn't be updated by a plain re-run).
 
 set -e
 
@@ -40,8 +43,9 @@ else
   repo_dir="${YMLX_DIR:-$HOME/.ymlx}"
 fi
 
-# Fetch a copy if the resolved dir has no ymlx.zsh yet.
-if [ ! -f "$repo_dir/ymlx.zsh" ]; then
+# Fetch a copy if the resolved dir has no ymlx.zsh yet, or when YMLX_FORCE=1
+# (in-app update for managed copies) forces a refresh from GitHub.
+if [ ! -f "$repo_dir/ymlx.zsh" ] || [ "$YMLX_FORCE" = "1" ]; then
   step "Downloading ymlx into $repo_dir …"
   mkdir -p "$repo_dir"
   ref="${YMLX_REF:-}"

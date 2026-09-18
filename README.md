@@ -63,7 +63,9 @@ ymlx
 ## Use
 
 - One model at a time on `:11500` — Enter starts it and drops straight into chat
-- `tab` toggles thinking per request · `esc` stops generation · `^s` stops server
+- `tab` toggles thinking · `esc` stops an answer mid-stream, and a lone `esc` at
+  the chat prompt returns to the menu (the server keeps running) · `^s` stops server
+- Status/confirm screens auto-continue instead of asking "press enter to continue".
 - **Chat history** records every chat; open it from the menu and **enter** a chat
   for actions: resume (continue the thread), copy to clipboard, rename, or
   delete permanently. `^d` deletes the highlighted chat at a keystroke; `esc`
@@ -88,5 +90,6 @@ prompt. **Advanced settings** — every `mlx_vlm` flag (`--kv-bits`,
 ymlx checks GitHub for a newer version at every launch; when one exists a
 `▲ Update available: X.Y.Z → A.B.C` banner appears and the menu gains an
 **Update to latest version** entry that pulls and reinstalls in place (a
-pi-managed install instead guides you to `pi update`). Installed version lives
-in the repo-root `VERSION` file (semver, currently 0.1.0).
+pi-managed install instead guides you to `pi update`; a curl/managed copy is
+refreshed from GitHub automatically). Installed version lives
+in the repo-root `VERSION` file (semver, currently 0.2.0).

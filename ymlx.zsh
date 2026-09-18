@@ -163,7 +163,7 @@ CFG
     local resume="${3:-}"
     if ! command -v python3 >/dev/null 2>&1; then
       gum style --foreground 196 "python3 not found — install Xcode Command Line Tools (xcode-select --install) to use the built-in chat."
-      gum input --placeholder "(press enter to continue)" >/dev/null
+      _ymlx_pause
       return 1
     fi
     local friendly=$(_ymlx_display_name "$model")
@@ -293,6 +293,12 @@ class Filter:
 flt = Filter("strip" if enable_thinking is False else "show")
 PROMPT = "\033[1;36myou>\033[0m "
 
+# Raised on a lone Esc while NOT mid-answer. Esc during an answer stops the
+# output; Esc at the prompt leaves the chat and returns to the main menu
+# (the server keeps running).
+class EscExit(Exception):
+    pass
+
 def log(msg):
     if log_path:
         try:
@@ -378,7 +384,7 @@ def input_line():
                     next_byte(0.05)
                     if 0x40 <= ord(nb) <= 0x7E:
                         break
-            continue  # lone Esc is ignored without eating the next key
+            raise EscExit  # lone Esc at the prompt leaves the chat (main menu)
         if b in ("\r", "\n"):
             sys.stdout.write("\r\n")
             sys.stdout.flush()
@@ -416,6 +422,9 @@ try:
             sys.stdout.write("\r\n")
             break
         except KeyboardInterrupt:
+            sys.stdout.write("\r\n")
+            break
+        except EscExit:
             sys.stdout.write("\r\n")
             break
         s = user.strip()
@@ -857,116 +866,241 @@ _ymlx_running() {
     models=$(ls "$hub_dir" 2>/dev/null | grep '^models--' | sed 's/models--//' | sed 's/--/\//g')
     for m in ${(f)models}; do installed[$m]=1; done
 
-    local dim_on=$'\e[2m' dim_off=$'\e[0m'
+    # ---- Parse the curated list. New format: blank-line-separated blocks of up
+    # to 3 lines (model, tags, optional description). Entries may be commented
+    # with a leading '#' — we strip it so every entry shows up (the '#' keeps the
+    # full catalog alongside the highlighted picks). The 3rd line for the
+    # highlighted entries is used as the description shown under the model.
+    # Tier headers are any line containing "GB RAM".
     typeset -A tier_header
-    local -a entry_tiers=() entry_sources=() entry_tags=() entry_dim=()
-    local source tags block_line=0 line current_tier=0 header num friendly max_w=0 fw
-
+    local -a p_src=() p_tags=() p_desc=() p_tier=() p_dim=()
+    local line current_tier=0 header num
     if [[ -r "$curated_file" ]]; then
+      local -a entry=()
+      _D_flush() {
+        ((${#entry[@]})) || return
+        local src="${entry[1]}" tags="${entry[2]:-}" desc="${entry[3]:-}"
+        entry=()
+        [[ -n "$src" ]] || return
+        (( current_tier == tier_active || current_tier == tier_dim )) || return
+        [[ -z "${installed[$src]}" ]] || return
+        p_src+=( "$src" ); p_tags+=( "$tags" ); p_desc+=( "$desc" )
+        p_tier+=( "$current_tier" ); p_dim+=( $(( current_tier == tier_dim )) )
+      }
       while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ -z "$line" ]]; then
-          block_line=0
+          _D_flush
           continue
         fi
         if [[ "$line" == *"GB RAM"* ]]; then
+          _D_flush
           header="$line"
           num="${header//[^0-9]/}"
           tier_header[$num]="$header"
           current_tier=$num
-          block_line=0
           continue
         fi
-        (( block_line++ ))
-        if (( block_line == 1 )); then
-          source="$line"
-        elif (( block_line == 2 )); then
-          tags="$line"
-          if [[ -z "${installed[$source]}" ]]; then
-            if (( current_tier == tier_active || current_tier == tier_dim )); then
-              friendly="${source##*/}"
-              entry_tiers+=( "$current_tier" )
-              entry_sources+=( "$source" )
-              entry_tags+=( "$tags" )
-              entry_dim+=( $(( current_tier == tier_dim )) )
-              fw=${#friendly}
-              (( fw > max_w )) && max_w=$fw
-            fi
-          fi
-          block_line=0
+        if [[ "$line" == \#* ]]; then
+          line="${line#\#}"
+          line="${line#"${line%%[![:space:]]*}"}"
         fi
+        entry+=( "$line" )
       done < "$curated_file"
+      _D_flush
     fi
-    (( max_w < 12 )) && max_w=12
 
-    typeset -A curated
-    local entries=() curated_count=0
-    local prev_tier=-1 hdr_line="" display
-    for (( i=1; i<=${#entry_sources[@]}; i++ )); do
-      if (( entry_tiers[$i] != prev_tier )); then
-        if (( entry_tiers[$i] == tier_dim )); then
-          hdr_line="${dim_on}  # ${tier_header[${entry_tiers[$i]}]}${dim_off}"
-        else
-          hdr_line="  # ${tier_header[${entry_tiers[$i]}]}"
-        fi
-        entries+=("$hdr_line")
-        prev_tier=${entry_tiers[$i]}
-      fi
-      friendly="${entry_sources[$i]##*/}"
-      if (( entry_dim[$i] )); then
-        display="${dim_on}$(printf '    %-*s  // %s' "$max_w" "$friendly" "${entry_tags[$i]}")${dim_off}"
-      else
-        display=$(printf '    %-*s  // %s' "$max_w" "$friendly" "${entry_tags[$i]}")
-      fi
-      entries+=("$display")
-      curated[$display]="${entry_sources[$i]}"
-      (( curated_count++ ))
+    # Deduplicate by model id, keeping the first occurrence (the highlighted
+    # entry with a description when one also appears commented in the catalog).
+    typeset -A seen
+    local -a srcs=() tags=() descs=() tiers=() dims=()
+    local i s
+    for (( i=1; i<=${#p_src[@]}; i++ )); do
+      s="${p_src[$i]}"
+      [[ -n "${seen[$s]}" ]] && continue
+      seen[$s]=1
+      srcs+=( "$s" ); tags+=( "${p_tags[$i]}" ); descs+=( "${p_desc[$i]}" )
+      tiers+=( "${p_tier[$i]}" ); dims+=( "${p_dim[$i]}" )
     done
 
-    if (( curated_count == 0 )); then
-      entries+=("    No more hand picked models available")
-    fi
-    entries+=("    ──────────────────────────────────────────" "    Custom            (paste HuggingFace ID)…" "    Back to Top")
-
-    local pick=$(printf "%s\n" "${entries[@]}" | gum choose --header $'\nDownload new model:' --height 30)
-    [[ -z "$pick" ]] && return
-
-    if [[ "$pick" == *"Back to Top"* || "$pick" == *──* || "$pick" == *"No more hand picked models available"* ]]; then
-      return
-    fi
-
-    local model
-    if [[ "$pick" == *"Custom"* ]]; then
-      model=$(gum input --placeholder "e.g. mlx-community/Ministral-3-3B-Instruct-2512-4bit" --prompt "Model: ")
-    else
-      model="${curated[$pick]}"
-    fi
-    [[ -z "$model" ]] && return
-
-    # First download of the session without a token: offer to set one so the
-    # "unauthenticated requests" warning goes away. Skipping is remembered for
-    # the rest of this session, so it stays out of the way.
-    if ! _ymlx_hf_has_token && (( _YMLX_HF_SKIPPED == 0 )); then
-      if ! _ymlx_hf_setup; then
-        _YMLX_HF_SKIPPED=1
+    # ---- Build flat rows for the menu. Cursor/nav only lands on rows with
+    # RCUR=1; RDIM records rows that render dimmed when not under the cursor.
+    local dim_on=$'\e[2m' dim_off=$'\e[0m'
+    local max_w=12 fw friendly tline
+    for (( i=1; i<=${#srcs[@]}; i++ )); do
+      fw=${#${srcs[$i]##*/}}
+      (( fw > max_w )) && max_w=$fw
+    done
+    local -a ROWS=() RCUR=() RSRC=() RDIM=()
+    local prev_tier=-1
+    for (( i=1; i<=${#srcs[@]}; i++ )); do
+      if (( tiers[$i] != prev_tier )); then
+        ROWS+=( "  # ${tier_header[${tiers[$i]}]}" ); RCUR+=( 0 ); RSRC+=( "" ); RDIM+=( 1 )
+        prev_tier=${tiers[$i]}
       fi
+      friendly="${srcs[$i]##*/}"
+      tline=$(printf '    %-*s  // %s' "$max_w" "$friendly" "${tags[$i]}")
+      if [[ -n "${descs[$i]}" ]]; then
+        ROWS+=( "$tline" ); RCUR+=( 1 ); RSRC+=( "${srcs[$i]}" ); RDIM+=( "${dims[$i]}" )
+        ROWS+=( "      ${descs[$i]}" ); RCUR+=( 0 ); RSRC+=( "" ); RDIM+=( 1 )
+      else
+        ROWS+=( "$tline" ); RCUR+=( 1 ); RSRC+=( "${srcs[$i]}" ); RDIM+=( "${dims[$i]}" )
+      fi
+    done
+
+    if (( ${#srcs[@]} == 0 )); then
+      ROWS+=( "    No more hand picked models available" ); RCUR+=( 0 ); RSRC+=( "" ); RDIM+=( 1 )
+    fi
+    ROWS+=( "    ──────────────────────────────────────────" ); RCUR+=( 0 ); RSRC+=( "" ); RDIM+=( 1 )
+    ROWS+=( "    Custom            (paste HuggingFace ID)…" ); RCUR+=( 1 ); RSRC+=( "__custom__" ); RDIM+=( 0 )
+    ROWS+=( "    Back to Top" ); RCUR+=( 1 ); RSRC+=( "__back__" ); RDIM+=( 0 )
+
+    # If any "t3" shorthand is shown, explain it on the bottom line.
+    local has_t3=0
+    for (( i=1; i<=${#tags[@]}; i++ )); do
+      [[ "${tags[$i]}" == *t3* ]] && { has_t3=1; break; }
+    done
+
+    # ---- Terminal/state locals for the key-driven menu.
+    local term_lines=${LINES:-24}
+    (( term_lines < 8 )) && term_lines=24
+    local vis=$(( term_lines - 7 ))
+    (( vis < 1 )) && vis=1
+    local width=${COLUMNS:-80}
+    (( width < 40 )) && width=80
+    local cursor=0 scroll=0 drawn=0 nlines=0 quit=0
+    local up1=$'\e'[A up2=$'\e'OA down1=$'\e'[B down2=$'\e'OB
+    local footer="↑/↓ nav • enter select • esc back"
+    if (( has_t3 )); then
+      footer="$footer  •  t3 = text, tools, thinking"
     fi
 
-    echo
-    gum style --foreground 212 --bold "Downloading $model"
-    echo "(progress will stream below — Ctrl-C to abort)"
-    echo
-    if uvx --from mlx-vlm python3 -c "from mlx_vlm.utils import load; load('$model')"; then
-      echo
-      gum style --foreground 42 "✓ Downloaded: $model"
-      echo
-      if gum confirm "Start $model now?"; then
-        _ymlx_launch "$model"
+    local k
+    for (( k=1; k<=${#RCUR[@]}; k++ )); do
+      (( RCUR[$k] )) && { cursor=$(( k - 1 )); break; }
+    done
+
+    _D_scroll_cursor() {
+      local n=${#ROWS[@]} max=$(( n - vis ))
+      (( max < 0 )) && max=0
+      (( scroll > max )) && scroll=$max
+      if (( cursor < scroll )); then
+        scroll=$cursor
+      elif (( cursor >= scroll + vis )); then
+        scroll=$(( cursor - vis + 1 ))
       fi
-    else
+      (( scroll < 0 )) && scroll=0
+    }
+    _D_render() {
+      if (( drawn )); then
+        print -n -- "\033[${nlines}A\033[J"
+      fi
+      local -a out=()
+      out+=( $'\e[1;35mDownload new model:\e[0m' )
+      local n=${#ROWS[@]} end=$(( scroll + vis )) j line
+      (( end > n )) && end=n
+      for (( j=scroll; j<end; j++ )); do
+        line="${ROWS[$((j+1))]}"
+        if (( j == cursor )); then
+          out+=( $'\e[1;36m>'"${line:1}"$'\e[0m' )
+        elif (( RDIM[$((j+1))] )); then
+          out+=( "${dim_on}${line}${dim_off}" )
+        else
+          out+=( "$line" )
+        fi
+      done
+      out+=( $'\e[2m'"${footer:0:$(( width - 1 ))}"$'\e[0m' )
+      nlines=0
+      for line in "${out[@]}"; do
+        print -n -- "$line\033[K\n"
+        (( nlines++ ))
+      done
+      drawn=1
+    }
+    _D_clear() {
+      if (( drawn )); then
+        print -n -- "\033[${nlines}A\033[J"
+        drawn=0
+      fi
+    }
+    _D_move() {
+      local delta="$1" n=${#ROWS[@]} new=$cursor guard=$cursor
+      while true; do
+        new=$(( new + delta ))
+        (( new < 0 )) && new=$(( n - 1 ))
+        (( new >= n )) && new=0
+        if (( RCUR[$((new+1))] )); then
+          cursor=$new
+          break
+        fi
+        (( new == guard )) && break
+      done
+      _D_scroll_cursor
+    }
+    _D_do_download() {
+      local model="$1"
+      if ! _ymlx_hf_has_token && (( _YMLX_HF_SKIPPED == 0 )); then
+        if ! _ymlx_hf_setup; then
+          _YMLX_HF_SKIPPED=1
+        fi
+      fi
       echo
-      gum style --foreground 196 "✗ Download failed or cancelled."
-      gum input --placeholder "(press enter to continue)" >/dev/null
-    fi
+      gum style --foreground 212 --bold "Downloading $model"
+      echo "(progress will stream below — Ctrl-C to abort)"
+      echo
+      if uvx --from mlx-vlm python3 -c "from mlx_vlm.utils import load; load('$model')"; then
+        echo
+        gum style --foreground 42 "✓ Downloaded: $model"
+        echo
+        if gum confirm "Start $model now?"; then
+          _ymlx_launch "$model"
+        fi
+      else
+        echo
+        gum style --foreground 196 "✗ Download failed or cancelled."
+      fi
+      _ymlx_pause
+    }
+    _D_activate() {
+      local r=$(( cursor + 1 ))
+      (( RCUR[$r] )) || return
+      _D_clear
+      local src="${RSRC[$r]}" model=""
+      if [[ "$src" == "__custom__" ]]; then
+        model=$(gum input --placeholder "e.g. mlx-community/Ministral-3-3B-Instruct-2512-4bit" --prompt "Model: ")
+        [[ -n "$model" ]] && { _D_do_download "$model"; quit=1; }
+      elif [[ "$src" == "__back__" ]]; then
+        quit=1
+      else
+        _D_do_download "$src"
+        quit=1
+      fi
+    }
+
+    stty -ixon 2>/dev/null
+    _D_render
+    while true; do
+      _ymlx_main_read_key
+      local key="$_YMLX_MENU_KEY"
+      if [[ -z "$key" ]]; then
+        _D_clear
+        return
+      fi
+      if [[ "$key" == "$up1" || "$key" == "$up2" ]]; then
+        _D_move -1; _D_render
+      elif [[ "$key" == "$down1" || "$key" == "$down2" ]]; then
+        _D_move 1; _D_render
+      elif [[ "$key" == $'\n' || "$key" == $'\r' ]]; then
+        _D_activate
+        if (( quit )); then
+          _D_clear
+          return
+        fi
+        _D_render
+      elif [[ "$key" == $'\x11' || "$key" == $'\e' ]]; then
+        _D_clear
+        return
+      fi
+    done
   }
 
   _ymlx_chat_history_menu() {
@@ -1096,7 +1230,7 @@ _ymlx_running() {
       else
         echo
       fi
-      gum input --placeholder "(press enter to continue)" >/dev/null
+      _ymlx_pause
       _H_build; _H_render
     }
 
@@ -1116,7 +1250,7 @@ _ymlx_running() {
         else
           echo "Clipboard copy failed (pbcopy unavailable)."
         fi
-        gum input --placeholder "(press enter to continue)" >/dev/null
+        _ymlx_pause
         _H_render
         return
       fi
@@ -1127,7 +1261,7 @@ _ymlx_running() {
       if gum confirm "Open the exported file?"; then
         open "$out" 2>/dev/null
       fi
-      gum input --placeholder "(press enter to continue)" >/dev/null
+      _ymlx_pause
       _H_render
     }
 
@@ -1154,7 +1288,7 @@ open(f, "w").write("\n".join(out) + "\n")
 PY
         echo "Renamed chat."
       fi
-      gum input --placeholder "(press enter to continue)" >/dev/null
+      _ymlx_pause
     }
 
     _H_resume() {
@@ -1165,7 +1299,7 @@ PY
       if [[ -z "$model" ]]; then
         _H_clear
         gum style --foreground 196 "Can't determine the model for this chat (missing '# Model:' header)."
-        gum input --placeholder "(press enter to continue)" >/dev/null
+        _ymlx_pause
         _H_render
         return
       fi
@@ -1178,7 +1312,7 @@ PY
         gum style --foreground 212 --bold "Continuing chat: $(_ymlx_display_name "$model")"
         echo "The model isn't running — starting it first, then resuming the conversation."
         if ! _ymlx_launch "$model"; then
-          gum input --placeholder "(press enter to continue)" >/dev/null
+          _ymlx_pause
           _H_render
           return
         fi
@@ -1208,7 +1342,7 @@ PY
       done
       if (( ${#results[@]} == 0 )); then
         echo "No matches for: $q"
-        gum input --placeholder "(press enter to continue)" >/dev/null
+        _ymlx_pause
         _H_render
         return
       fi
@@ -1233,7 +1367,7 @@ PY
         else
           echo
         fi
-        gum input --placeholder "(press enter to continue)" >/dev/null
+        _ymlx_pause
         _H_build; _H_render
         return
       fi
@@ -1264,7 +1398,7 @@ PY
           else
             echo
           fi
-          gum input --placeholder "(press enter to continue)" >/dev/null
+          _ymlx_pause
           _H_build; _H_render
           ;;
       esac
@@ -1539,7 +1673,7 @@ PY
     else
       echo "Server for $model was already gone."
     fi
-    gum input --placeholder "(press enter to continue)" >/dev/null
+    _ymlx_pause
     _ymlx_main_rebuild_full
   }
 
@@ -1555,7 +1689,7 @@ PY
     local folder="$hub_dir/models--${model//\//--}"
     if [[ ! -d "$folder" ]]; then
       echo "Folder not found: $folder"
-      gum input --placeholder "(press enter to continue)" >/dev/null
+      _ymlx_pause
     else
       local warn=""
       [[ -n "$port" ]] && warn=" (running server will be stopped first)"
@@ -1571,7 +1705,7 @@ PY
         fi
         rm -rf "$folder"
         echo "Removed: $model"
-        gum input --placeholder "(press enter to continue)" >/dev/null
+        _ymlx_pause
       fi
     fi
     _ymlx_main_rebuild_full
@@ -1599,10 +1733,27 @@ PY
       echo "  pi update --extensions"
       echo "then restart ymlx."
     else
-      echo "This ymlx is a managed copy. Refresh it by re-running install.sh or"
-      echo "/ymlx-setup, then restart ymlx."
+      # Managed copy (installed via curl/install.sh, no .git). Fetch the
+      # latest install.sh and re-run it with YMLX_FORCE=1 + YMLX_REF=main so it
+      # re-downloads the newest source — a plain re-run of the copy's own
+      # install.sh wouldn't refresh it (and an old one won't know the flag).
+      echo "Refreshing managed copy from GitHub…"
+      local up_sh="$state_dir/install-update.sh"
+      if curl -fsSL --connect-timeout 3 --max-time 20 \
+           "https://raw.githubusercontent.com/pavsefcik/ymlx/main/install.sh" \
+           -o "$up_sh" 2>/dev/null; then
+        if YMLX_FORCE=1 YMLX_REF=main sh "$up_sh"; then
+          echo
+          gum style --foreground 82 --bold "ymlx updated — restart ymlx to use the new version."
+          _ymlx_check_update
+        else
+          echo "Update failed — check the install output above, then retry."
+        fi
+      else
+        echo "Couldn't download the latest install.sh (offline?) — update aborted."
+      fi
     fi
-    gum input --placeholder "(press enter to continue)" >/dev/null
+    _ymlx_pause
     _ymlx_main_rebuild_full
   }
 
@@ -1639,7 +1790,7 @@ PY
         if [[ -n "$_occ_pid" ]]; then
           echo "Port :11500 is busy running $_occ_model."
           echo "Stop it with ^s, then try again."
-          gum input --placeholder "(press enter to continue)" >/dev/null
+          _ymlx_pause
         else
           if _ymlx_launch "$model"; then
             _ymlx_chat_repl "$model" "11500"

@@ -77,6 +77,13 @@ _ymlx_find_port() {
   fi
 }
 
+# Auto-advance after a status message. Replaces the old "press enter to
+# continue" prompts so ymlx moves on by itself instead of asking to hit Enter;
+# the short pause still lets a result line be read before the next screen.
+_ymlx_pause() {
+  sleep 0.7
+}
+
 # Friendly display name: drop the org prefix (e.g. `mlx-community/`).
 _ymlx_friendly_name() {
   print -r -- "${1##*/}"
