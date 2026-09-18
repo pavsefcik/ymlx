@@ -53,13 +53,34 @@ ymlx() {
   mkdir -p "$state_dir" "$log_dir" "$chat_dir"
 
   # The curated download list lives in the standalone ymlx-curator repo; pull
-  # the latest copy at startup and cache it. If the fetch fails (offline),
-  # fall back to the last cached copy.
+  # the latest copy at startup and cache it. Retry a few times, then fall back
+  # to the github.com mirror, and only if both fail use the last cached copy.
   local curated_url="https://raw.githubusercontent.com/pavsefcik/ymlx-curator/main/ymlx-curator.md"
+  local curated_mirror="https://github.com/pavsefcik/ymlx-curator/raw/main/ymlx-curator.md"
   local curated_file="$state_dir/curated-llms.md"
-  if ! curl -fsSL --connect-timeout 3 --max-time 5 "$curated_url" -o "$curated_file" 2>/dev/null; then
-    [[ -f "$curated_file" ]] || : > "$curated_file"
+  local curated_tmp="$curated_file.tmp" curated_refreshed=0 attempt
+  for attempt in 1 2 3; do
+    if curl -fsSL --connect-timeout 8 --max-time 20 "$curated_url" -o "$curated_tmp" 2>/dev/null \
+       && [[ -s "$curated_tmp" ]]; then
+      mv "$curated_tmp" "$curated_file"
+      curated_refreshed=1
+      break
+    fi
+  done
+  if (( curated_refreshed == 0 )); then
+    if curl -fsSL --connect-timeout 8 --max-time 20 "$curated_mirror" -o "$curated_tmp" 2>/dev/null \
+       && [[ -s "$curated_tmp" ]]; then
+      mv "$curated_tmp" "$curated_file"
+      curated_refreshed=1
+    fi
   fi
+  if (( curated_refreshed == 0 )); then
+    [[ -f "$curated_file" ]] || : > "$curated_file"
+    if (( $# == 0 )); then
+      print -u2 "ymlx: couldn't refresh the curated model list — using the cached copy."
+    fi
+  fi
+  rm -f "$curated_tmp"
 
   _ymlx_write_default_config() {
     cat > "$1" <<'CFG'
@@ -853,8 +874,10 @@ _ymlx_running() {
   _ymlx_download_menu() {
     local ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
     local tier_active tier_dim
-    if (( ram_gb >= 24 )); then
-      tier_active=24; tier_dim=16
+    # Tiers in ymlx-curator.md are now 8 / 16 / 32 GB; show the machine's tier
+    # as active plus the next lower tier dimmed.
+    if (( ram_gb >= 32 )); then
+      tier_active=32; tier_dim=16
     elif (( ram_gb >= 16 )); then
       tier_active=16; tier_dim=8
     else
