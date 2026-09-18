@@ -873,15 +873,15 @@ _ymlx_running() {
 
   _ymlx_download_menu() {
     local ram_gb=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
-    local tier_active tier_dim
-    # Tiers in ymlx-curator.md are now 8 / 16 / 32 GB; show the machine's tier
-    # as active plus the next lower tier dimmed.
+    local tier_active
+    # Tiers in ymlx-curator.md are 8 / 16 / 32 GB; show only the machine's own
+    # tier (no cross-tier models and no tier-header lines).
     if (( ram_gb >= 32 )); then
-      tier_active=32; tier_dim=16
+      tier_active=32
     elif (( ram_gb >= 16 )); then
-      tier_active=16; tier_dim=8
+      tier_active=16
     else
-      tier_active=8; tier_dim=0
+      tier_active=8
     fi
 
     typeset -A installed
@@ -905,10 +905,10 @@ _ymlx_running() {
         local src="${entry[1]}" tags="${entry[2]:-}" desc="${entry[3]:-}"
         entry=()
         [[ -n "$src" ]] || return
-        (( current_tier == tier_active || current_tier == tier_dim )) || return
+        (( current_tier == tier_active )) || return
         [[ -z "${installed[$src]}" ]] || return
         p_src+=( "$src" ); p_tags+=( "$tags" ); p_desc+=( "$desc" )
-        p_tier+=( "$current_tier" ); p_dim+=( $(( current_tier == tier_dim )) )
+        p_tier+=( "$current_tier" ); p_dim+=( 0 )
       }
       while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ -z "$line" ]]; then
@@ -954,12 +954,7 @@ _ymlx_running() {
       (( fw > max_w )) && max_w=$fw
     done
     local -a ROWS=() RCUR=() RSRC=() RDIM=()
-    local prev_tier=-1
     for (( i=1; i<=${#srcs[@]}; i++ )); do
-      if (( tiers[$i] != prev_tier )); then
-        ROWS+=( "  # ${tier_header[${tiers[$i]}]}" ); RCUR+=( 0 ); RSRC+=( "" ); RDIM+=( 1 )
-        prev_tier=${tiers[$i]}
-      fi
       friendly="${srcs[$i]##*/}"
       tline=$(printf '    %-*s  // %s' "$max_w" "$friendly" "${tags[$i]}")
       if [[ -n "${descs[$i]}" ]]; then
