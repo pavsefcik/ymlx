@@ -260,6 +260,11 @@ async function wireYmlx(ui: SetupUI): Promise<boolean> {
         join(dirname(zsh), "lib", "ymlx-helpers.zsh"),
         join(YMLX_STABLE, "lib", "ymlx-helpers.zsh")
       );
+      // The chat REPL runs as its own Python file (not a zsh heredoc).
+      await copyFile(
+        join(dirname(zsh), "lib", "ymlx_repl.py"),
+        join(YMLX_STABLE, "lib", "ymlx_repl.py")
+      );
       // Version lives next to ymlx.zsh (self-update notice reads it); best-effort.
       await copyFile(
         join(dirname(zsh), "VERSION"),

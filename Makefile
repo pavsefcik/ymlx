@@ -18,9 +18,15 @@ REPO    := pavsefcik/ymlx
 BREW    := ../homebrew-ymlx
 FORMULA := $(BREW)/Formula/ymlx.rb
 
-.PHONY: release check bump commit tag info formula
+.PHONY: release check bump commit tag info formula test
 
 release: check bump commit tag info
+
+# Run the test suite: Python (stream filter, request body, pty integration)
+# and zsh (thinking classifier/spec, launch flags).
+test:
+	python3 -m unittest discover -s tests
+	zsh tests/test_helpers.zsh
 
 # Refuse to tag a dirty tree.
 check:

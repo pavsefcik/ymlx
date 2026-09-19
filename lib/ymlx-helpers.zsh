@@ -67,14 +67,18 @@ _ymlx_port_free() {
   ! lsof -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1
 }
 
-# ymlx pins everything to :11500 so agentic CLIs always find the model.
+# ymlx prefers :11500 so agentic CLIs always find the model, and falls back to
+# the next free port so a second model can run in parallel.
 _ymlx_find_port() {
-  if _ymlx_port_free 11500; then
-    echo 11500
-  else
-    echo ""
-    return 1
-  fi
+  local p
+  for p in {11500..11509}; do
+    if _ymlx_port_free "$p"; then
+      echo "$p"
+      return 0
+    fi
+  done
+  echo ""
+  return 1
 }
 
 # Auto-advance after a status message. Replaces the old "press enter to
@@ -112,4 +116,69 @@ _ymlx_ministral_sibling() {
 #   mlx-community/Ministral-3-3B-Instruct-2512-4bit -> Ministral-3-3B-4bit
 _ymlx_ministral_base() {
   print -r -- "$(print -r -- "${1##*/}" | sed -E 's/-([Ii]nstruct|[Rr]easoning)-[^-]+-/-/')"
+}
+
+# Classify a model into a thinking family. Reads model_type from the cached
+# config.json ($2 = HF hub dir), falling back to the id.
+#   qwen | gemma | ministral-reasoning | ministral-instruct | lfm | generic
+_ymlx_model_family() {
+  local model="$1" hub_dir="$2" base="${1##*/}" mt="" snap
+  if [[ -n "$hub_dir" ]]; then
+    snap=$(ls -d "$hub_dir/models--${model//\//--}"/snapshots/*(N/) 2>/dev/null | head -n1)
+    [[ -n "$snap" && -f "$snap/config.json" ]] \
+      && mt=$(sed -n 's/.*"model_type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$snap/config.json" | head -n1)
+  fi
+  case "$mt" in
+    qwen*) echo qwen; return ;;
+    gemma*) echo gemma; return ;;
+    lfm*) echo lfm; return ;;
+    mistral3|ministral3)
+      [[ "$base" == *-Reasoning-* ]] && echo ministral-reasoning || echo ministral-instruct
+      return ;;
+  esac
+  case "$base" in
+    *Qwen*|*qwen*) echo qwen ;;
+    *[Gg]emma*) echo gemma ;;
+    *LFM*|*lfm*) echo lfm ;;
+    *Ministral*|*ministral*)
+      [[ "$base" == *-Reasoning-* ]] && echo ministral-reasoning || echo ministral-instruct ;;
+    *) echo generic ;;
+  esac
+}
+
+# Thinking spec for a model: control<TAB>markers<TAB>reasoning-first.
+#   control: enable_thinking (template bool) | variant (model id decides) | none
+#   markers: think (<think>) | channel (<|channel>thought) | bracket ([THINK]) | none
+#   reasoning-first: 1 when the trace starts immediately (Ministral Reasoning)
+_ymlx_thinking_spec() {
+  case "$(_ymlx_model_family "$1" "$2")" in
+    qwen)                 print -r -- $'enable_thinking\tthink\t0' ;;
+    gemma)                print -r -- $'enable_thinking\tchannel\t0' ;;
+    ministral-reasoning)  print -r -- $'variant\tbracket\t1' ;;
+    ministral-instruct)   print -r -- $'variant\tnone\t0' ;;
+    lfm)                  print -r -- $'none\tthink\t0' ;;
+    *)                    print -r -- $'enable_thinking\tthink\t0' ;;
+  esac
+}
+
+# Mutate the named server-flag array ($1) for launching $2 (a model id) with
+# $3 the HF hub dir:
+#   * drop any stale/hand-written --enable-thinking, then add it iff the user's
+#     toggle is explicitly "on" (the resolved default for API clients; the REPL
+#     still sends the value per request);
+#   * add Ministral's [THINK]/[/THINK] markers so the server splits its trace
+#     into reasoning_content even outside the REPL.
+_ymlx_apply_launch_thinking() {
+  local name="$1" model="$2" hub_dir="$3"
+  local spec markers
+  spec=$(_ymlx_thinking_spec "$model" "$hub_dir")
+  spec="${spec#*$'\t'}"
+  markers="${spec%%$'\t'*}"
+  _ymlx_flag_set "$name" --enable-thinking 0
+  [[ "${YMLX_QUICK_THINKING:-default}" == "on" ]] \
+    && _ymlx_flag_set "$name" --enable-thinking 1
+  if [[ "$markers" == "bracket" ]]; then
+    _ymlx_replace_or_append "$name" --thinking-start-token "[THINK]"
+    _ymlx_replace_or_append "$name" --thinking-end-token "[/THINK]"
+  fi
 }

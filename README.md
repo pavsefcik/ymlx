@@ -62,9 +62,16 @@ ymlx
 
 ## Use
 
-- One model at a time on `:11500` — Enter starts it and drops straight into chat
-- `tab` toggles thinking · `esc` stops an answer mid-stream, and a lone `esc` at
-  the chat prompt returns to the menu (the server keeps running) · `^s` stops server
+- Start model and run — Enter starts the highlighted model and drops straight
+  into chat. If another model is already running, ymlx asks **Yes** (swap:
+  stop it and run the selected one on `:11500`), **No**, or **Run in parallel**
+  (keep both, the new one on the next free port). Multiple models can run at
+  once; each shows a `●` in the menu, and `^s` stops the highlighted one.
+- Thinking is off by default; `tab` turns it on and the reasoning trace then
+  shows in grey above the answer. Each family is handled natively (Qwen/Gemma
+  via their templates, Ministral via its Instruct/Reasoning pair). `esc` stops
+  an answer mid-stream, and a lone `esc` at the chat prompt returns to the menu
+  (the server keeps running) · `^s` stops server
 - Status/confirm screens auto-continue instead of asking "press enter to continue".
 - **Chat history** records every chat; open it from the menu and **enter** a chat
   for actions: resume (continue the thread), copy to clipboard, rename, or
@@ -96,4 +103,4 @@ ymlx checks GitHub for a newer version at every launch; when one exists a
 **Update to latest version** entry that pulls and reinstalls in place (a
 pi-managed install instead guides you to `pi update`; a curl/managed copy is
 refreshed from GitHub automatically). Installed version lives
-in the repo-root `VERSION` file (semver, currently 0.11.0).
+in the repo-root `VERSION` file (semver, currently 0.12.0).

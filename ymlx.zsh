@@ -8,6 +8,10 @@ unsetopt xtrace verbose 2>/dev/null
 # here, so we won't kill what we didn't start.
 typeset -ga _YMLX_SESSION_PIDS=()
 
+# Port chosen by the most recent _ymlx_launch (for callers that need to know
+# where a freshly launched model landed, e.g. parallel runs).
+typeset -g _YMLX_LAST_LAUNCH_PORT=""
+
 # Self-contained helpers (no dependence on ymlx()'s locals) live in lib/.
 local _YMLX_SRC_DIR="${0:A:h}"
 source "$_YMLX_SRC_DIR/lib/ymlx-helpers.zsh"
@@ -88,7 +92,8 @@ ymlx() {
 # common toggles (thinking / temp / max-tokens / system prompt); they live in
 # the managed block below and ymlx rewrites it. Hand-edit anything below the
 # block to add advanced flags — see `mlx_vlm.chat --help` / `mlx_vlm.server --help`.
-# --model / --port / --host are managed by ymlx (pinned to :11500).
+# --model / --port / --host are managed by ymlx (prefers :11500; parallel runs
+# take the next free port).
 
 # >>> ymlx-managed quick settings — edit via "Basic settings" <<<
 YMLX_QUICK_THINKING="default"      # default | on | off  (default = use model's built-in)
@@ -99,10 +104,11 @@ YMLX_QUICK_SYSTEM_PROMPT=""        # chat only; empty disables
 
 # CHAT_FLAGS are informational: the built-in REPL talks to the running server
 # over HTTP, so the SERVER_FLAGS below are the ones that take effect at runtime.
+# Thinking is per-model-family: ymlx resolves it at launch and per request
+# (see the "Thinking" quick setting), so it is not written here.
 YMLX_CHAT_FLAGS=(
   --max-tokens 2048
   --temperature 0.7
-  # --enable-thinking
   # --thinking-budget 100
   # --thinking-mode enabled
   # --max-kv-size 4096
@@ -113,10 +119,7 @@ YMLX_CHAT_FLAGS=(
 
 YMLX_SERVER_FLAGS=(
   # --max-tokens 2048
-  # --enable-thinking      # Basic settings manages on/off; requests may override per-request
   # --thinking-budget 100
-  # --thinking-start-token " thinking"
-  # --thinking-end-token " response"
   # --draft-model mlx-community/some-draft-model
   # --draft-kind dflash
   # --max-num-seqs 1
@@ -188,35 +191,39 @@ CFG
       _ymlx_pause
       return 1
     fi
+    if [[ ! -f "$_YMLX_SRC_DIR/lib/ymlx_repl.py" ]]; then
+      gum style --foreground 196 "chat REPL missing ($_YMLX_SRC_DIR/lib/ymlx_repl.py) — re-run install.sh or /ymlx-setup."
+      _ymlx_pause
+      return 1
+    fi
     local sysp="$YMLX_QUICK_SYSTEM_PROMPT"
-    local rc ministral_other co chat_log url friendly
+    local rc ministral_other co chat_log url friendly spec control markers rf
     while true; do
       sysp="$YMLX_QUICK_SYSTEM_PROMPT"
       url="http://127.0.0.1:$port/v1/chat/completions"
       friendly=$(_ymlx_display_name "$model")
       local thinking="${YMLX_QUICK_THINKING:-default}"
       local stamp safe
-      # If chatting one half of a Ministral pair (Instruct or Reasoning), tab
-      # swaps to the sibling — tell the REPL so it can raise exit-3 to request
-      # the swap.
+      # Ministral ships as an Instruct+Reasoning pair; tab swaps to the sibling
+      # (the REPL exits 3 to request it).
       ministral_other=""
       if [[ "${model##*/}" == *-Instruct-* || "${model##*/}" == *-Reasoning-* ]]; then
         co=$(_ymlx_ministral_sibling "$model")
         [[ -d "$hub_dir/models--${co//\//--}" ]] && ministral_other="$co"
       fi
-      # The banner's "Thinking:" reflects the model variant: a Reasoning pair
-      # half is inherently "on", an Instruct half "off". YMLX_QUICK_THINKING
-      # still drives the enable_thinking request override sent to the REPL.
-      local is_reasoning=0 thinking_disp="$thinking"
-      if [[ "${model##*/}" == *-Reasoning-* ]]; then
-        is_reasoning=1
-        thinking_disp="on"
-      elif [[ "${model##*/}" == *-Instruct-* ]]; then
-        thinking_disp="off"
-      fi
+      # Thinking is per-family. Only an explicit "on" shows a reasoning trace
+      # (both "default" and "off" hide it). The family decides the control knob
+      # and the inline marker set; the REPL gets both.
+      spec=$(_ymlx_thinking_spec "$model" "$hub_dir")
+      control="${spec%%$'\t'*}"; spec="${spec#*$'\t'}"
+      markers="${spec%%$'\t'*}"; rf="${spec#*$'\t'}"
+      local is_reasoning=0
+      [[ "$rf" == "1" ]] && is_reasoning=1
+      local thinking_disp="off"
+      [[ "$thinking" == "on" ]] && thinking_disp="on"
       if [[ -n "$resume" && -f "$resume" ]]; then
-        # Resume: append to the existing chat's log and seed the conversation
-        # from that log inside the python REPL (resume path is arg 8).
+        # Resume: append to the existing chat's log; the REPL seeds the
+        # conversation from it.
         chat_log="$resume"
         echo "# Resumed: $(date '+%Y-%m-%d %H:%M:%S')" >> "$chat_log"
       else
@@ -239,7 +246,7 @@ CFG
         echo "  (resuming an existing conversation — new messages append to its log)"
       fi
       echo "  Base URL:   http://localhost:$port/v1"
-echo "  Model:      $model"
+      echo "  Model:      $model"
       echo "  Commands:   /reset clears history • /exit or Ctrl-D to leave"
       if [[ -n "$ministral_other" ]]; then
         echo "  Thinking:   $thinking_disp • tab swaps instruct↔reasoning"
@@ -247,411 +254,21 @@ echo "  Model:      $model"
         echo "  Thinking:   $thinking_disp • tab toggle thinking"
       fi
       echo
-python3 -c "$(cat <<'PY'
-import sys, json, re, signal, termios, tty, select, os, codecs, urllib.request, urllib.error
-
-url, model = sys.argv[1], sys.argv[2]
-sysp = sys.argv[3] if len(sys.argv) > 3 else ""
-thinking = sys.argv[4] if len(sys.argv) > 4 else "default"
-log_path = sys.argv[5] if len(sys.argv) > 5 else ""
-temp = sys.argv[6] if len(sys.argv) > 6 else ""
-max_tokens = sys.argv[7] if len(sys.argv) > 7 else ""
-# When chatting one half of a Ministral pair, tab drops us back to the shell
-# (exit 3) so it can swap to the sibling variant (Instruct <-> Reasoning).
-ministral_other = sys.argv[9] if len(sys.argv) > 9 else ""
-# True when the chat model is a Reasoning-variant half of a Ministral pair.
-# Such models always emit a thinking block, so the REPL knows to treat
-# everything up to the closing token as thinking (no opener is required).
-is_reasoning = len(sys.argv) > 10 and sys.argv[10] == "1"
-
-# thinking: "default" | "on" | "off". enable_thinking is the per-request
-# override mlx_vlm.server reads as the top-level "enable_thinking" field;
-# None = leave it to the server default (--enable-thinking).
-if thinking == "on":
-    enable_thinking = True
-elif thinking == "off":
-    enable_thinking = False
-else:
-    enable_thinking = None
-
-base = ([{"role":"system","content":sysp}] if sysp else [])
-messages = list(base)
-
-# Resume: when a previous chat log is provided, seed the conversation from it.
-# Lines are `you> …` / `assistant> …`; `(history cleared)` resets context.
-resume = sys.argv[8] if len(sys.argv) > 8 else ""
-if resume:
-    try:
-        with open(resume) as _rf:
-            for _rl in _rf:
-                _rl = _rl.rstrip("\n")
-                if _rl.startswith("you> "):
-                    messages.append({"role": "user", "content": _rl[5:]})
-                elif _rl.startswith("assistant> "):
-                    _c = _rl[11:]
-                    if _c.endswith(" [stopped]"):
-                        _c = _c[:-10]
-                    messages.append({"role": "assistant", "content": _c})
-                elif _rl == "(history cleared)":
-                    messages = list(base)
-    except OSError:
-        pass
-
-OPEN = re.compile(r' thinking|\[THINK\]', re.IGNORECASE)
-CLOSE = re.compile(r' response|\[/THINK\]', re.IGNORECASE)
-# Explicit Ministral tags. For reasoning models the thinking is delimited by
-# [THINK]…[/THINK]; the loose " thinking"/" response" words must NOT be used
-# as the close for Ministral, or a bare " response" inside the reasoning would
-# truncate it prematurely. We close strictly on the explicit [\/THINK] tag.
-ROPEN  = re.compile(r'\s*\[THINK\]', re.IGNORECASE)
-RCLOSE = re.compile(r'\[/THINK\]', re.IGNORECASE)
-TAIL = 10  # max bytes to hold back in case a tag straddles chunks
-GRAY = "\033[2m"
-RESET = "\033[0m"
-ANSI = re.compile(r'\x1b\[[0-9;]*m')
-decoder = codecs.getincrementaldecoder("utf-8")("replace")
-
-class Filter:
-    # mode "show" renders thinking dim/gray; mode "strip" drops it entirely.
-    #
-    # A reasoning model's thinking can reach the client two ways, depending on
-    # the server/template:
-    #   * external — streamed in the separate reasoning_content field, leaving
-    #     content as the clean answer; or
-    #   * inline — embedded in content as [THINK]…[/THINK].
-    # This filter handles both. Inline closing is done strictly on [/THINK] so
-    # a " response" word inside the reasoning never cuts the block short, and
-    # the whole trace from the start is kept grey before the switch to white.
-    def __init__(self, mode, reasoning=False):
-        self.mode = mode
-        self.reasoning = reasoning
-        self.external = False   # reasoning arrives via reasoning_content
-        self.done = not reasoning   # reasoning: thinking block comes first
-        self.in_think = False   # generic (Qwen-style) open/close limiters
-        self.buf = ""
-    def external_reasoning(self, text):
-        # Server routed the trace to reasoning_content; content is the answer.
-        body = (self.buf + text) if self.buf else text   # merge any inline tail
-        self.buf = ""
-        self.external = True
-        self.done = True
-        self.in_think = False
-        return (GRAY + body + RESET) if self.mode == "show" else ""
-    def feed_content(self, text):
-        if not self.reasoning:
-            return self._feed_open_close(text)
-        if self.external:
-            return text      # clean answer; reasoning already rendered grey
-        self.buf += text
-        return self._feed_inline()
-    def _feed_inline(self):
-        # Drop a single leading explicit opener so display starts clean.
-        m0 = ROPEN.match(self.buf)
-        if m0:
-            self.buf = self.buf[m0.end():]
-        out = []
-        while True:
-            if self.done:
-                if len(self.buf) > TAIL:
-                    out.append(self.buf[:-TAIL])
-                    self.buf = self.buf[-TAIL:]
-                break
-            m = RCLOSE.search(self.buf)
-            if not m:
-                break
-            if self.mode == "show":
-                out.append(GRAY + self.buf[:m.start()] + RESET)
-            self.buf = self.buf[m.end():]
-            self.done = True
-        return "".join(out)
-    def _feed_open_close(self, text):
-        # generic (non-ministral) models: alternate " thinking" / " response".
-        self.buf += text
-        out = []
-        while True:
-            if self.in_think:
-                m = CLOSE.search(self.buf)
-                if not m:
-                    break
-                if self.mode == "show":
-                    out.append(GRAY + self.buf[:m.start()] + RESET)
-                self.buf = self.buf[m.end():]
-                self.in_think = False
-            else:
-                m = OPEN.search(self.buf)
-                if m:
-                    out.append(self.buf[:m.start()])
-                    self.buf = self.buf[m.end():]
-                    self.in_think = True
-                else:
-                    if len(self.buf) > TAIL:
-                        out.append(self.buf[:-TAIL])
-                        self.buf = self.buf[-TAIL:]
-                    break
-        return "".join(out)
-    def flush(self):
-        if self.reasoning:
-            rest, self.buf = self.buf, ""
-            if not self.done:
-                # never closed — whatever remains is still thinking.
-                return (GRAY + rest + RESET) if self.mode == "show" else ""
-            return rest
-        if self.in_think:
-            out = (GRAY + self.buf + RESET) if self.mode == "show" else ""
-            self.buf = ""
-            self.in_think = False
-            return out
-        rest, self.buf = self.buf, ""
-        return rest
-
-flt = Filter("strip" if enable_thinking is False else "show", reasoning=is_reasoning)
-PROMPT = "\033[1;36myou>\033[0m "
-
-# Raised on a lone Esc while NOT mid-answer. Esc during an answer stops the
-# output; Esc at the prompt leaves the chat and returns to the main menu
-# (the server keeps running).
-class EscExit(Exception):
-    pass
-
-def log(msg):
-    if log_path:
-        try:
-            with open(log_path, "a") as f:
-                f.write(msg + "\n")
-        except OSError:
-            pass
-
-def toggle_thinking():
-    global enable_thinking
-    if enable_thinking is None:
-        enable_thinking = True
-    else:
-        enable_thinking = not enable_thinking
-    flt.mode = "show" if enable_thinking else "strip"
-    state = "on" if enable_thinking else "off"
-    sys.stdout.write("\r\033[2m(thinking %s)\033[0m\r\n" % state)
-    sys.stdout.flush()
-
-# Ctrl-T (SIGINFO) also toggles thinking when the terminal delivers it.
-try:
-    signal.signal(signal.SIGINFO, lambda s, f: toggle_thinking())
-except Exception:
-    pass
-
-# Raw-mode terminal so we can see Tab and Esc as bytes instead of cooked input.
-FD = 0
-IN = ""  # leftover type-ahead / partially read input
-
-def key_available(timeout=0.0):
-    return bool(select.select([FD], [], [], timeout)[0])
-
-def fill(timeout=None):
-    global IN
-    if IN:
-        return True
-    # Incremental decoder keeps a multibyte UTF-8 char intact even if a
-    # paste lands on a read() boundary (os.read(FD, 32) may split it).
-    while True:
-        if not key_available(timeout):
-            return False
-        raw = os.read(FD, 32)
-        if not raw:
-            return False  # EOF
-        IN = decoder.decode(raw)
-        if IN:
-            return True
-        # Decoded nothing yet (partial multibyte char). Keep reading only
-        # when blocking; for bounded peeks, report "nothing yet".
-        if timeout is not None:
-            return False
-
-def next_byte(timeout=None):
-    global IN
-    if not fill(timeout):
-        return ""
-    b = IN[0]
-    IN = IN[1:]
-    return b
-
-def peek_byte(timeout=0.05):
-    if fill(timeout):
-        return IN[0]
-    return ""
-
-def input_line():
-    global IN
-    buf = ""
-    sys.stdout.write(PROMPT)
-    sys.stdout.flush()
-    while True:
-        b = next_byte(None)
-        if b == "":
-            raise EOFError
-        if b == "\x1b":
-            nxt = peek_byte(0.05)
-            if nxt in ("[", "O"):
-                next_byte(0.05)  # consume the sequence introducer
-                while True:
-                    nb = peek_byte(0.05)
-                    if not nb:
-                        break
-                    next_byte(0.05)
-                    if 0x40 <= ord(nb) <= 0x7E:
-                        break
-            raise EscExit  # lone Esc at the prompt leaves the chat (main menu)
-        if b in ("\r", "\n"):
-            sys.stdout.write("\r\n")
-            sys.stdout.flush()
-            return buf
-        if b == "\x03":
-            sys.stdout.write("\r\n")
-            sys.stdout.flush()
-            raise KeyboardInterrupt
-        if b == "\x04":
-            sys.stdout.write("\r\n")
-            sys.stdout.flush()
-            raise EOFError
-        if b in ("\x7f", "\x08"):
-            if buf:
-                buf = buf[:-1]
-                sys.stdout.write("\b \b")
-                sys.stdout.flush()
-            continue
-        if b == "\t":
-            if ministral_other:
-                if is_reasoning:
-                    sys.stdout.write("\r\n\033[2mSwitching to the instruct version…\033[0m\r\n")
-                else:
-                    sys.stdout.write("\r\n\033[2mSwitching to the reasoning (thinking) version…\033[0m\r\n")
-                sys.stdout.flush()
-                sys.exit(3)
-            toggle_thinking()
-            sys.stdout.write(PROMPT + buf)
-            sys.stdout.flush()
-            continue
-        buf += b
-        sys.stdout.write(b)
-        sys.stdout.flush()
-
-old_term = termios.tcgetattr(FD)
-try:
-    tty.setraw(FD)
-    while True:
-        try:
-            user = input_line()
-        except EOFError:
-            sys.stdout.write("\r\n")
-            break
-        except KeyboardInterrupt:
-            sys.stdout.write("\r\n")
-            break
-        except EscExit:
-            sys.stdout.write("\r\n")
-            break
-        s = user.strip()
-        if not s:
-            continue
-        if s in ("/exit", "/quit", "exit", "quit"):
-            break
-        if s == "/reset":
-            messages = list(base)
-            sys.stdout.write("\r\n\033[2m(history cleared)\033[0m\r\n")
-            sys.stdout.flush()
-            log("(history cleared)")
-            continue
-        messages.append({"role":"user","content":user})
-        log("you> " + user)
-        body = {"model":model, "messages":messages, "stream":True}
-        if enable_thinking is not None:
-            body["enable_thinking"] = enable_thinking
-        if temp:
-            try:
-                body["temperature"] = float(temp)
-            except ValueError:
-                pass
-        if max_tokens:
-            try:
-                body["max_tokens"] = int(max_tokens)
-            except ValueError:
-                pass
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type":"application/json"})
-        print("\033[1;35massistant>\033[0m ", end="", flush=True)
-        full = ""
-        visible = ""
-        stopped = False
-        try:
-            with urllib.request.urlopen(req) as r:
-                for raw in r:
-                    if key_available(0):
-                        k = os.read(FD, 4096).decode("utf-8", "replace")
-                        if "\x1b" in k:
-                            stopped = True
-                            break
-                        IN = k + IN
-                    line = raw.decode("utf-8", "replace").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        d = chunk["choices"][0]["delta"]
-                        # Server may route reasoning to a separate
-                        # reasoning_content field (Qwen-style) OR leave it
-                        # inline in content (Ministral). Route both so the
-                        # trace always shows in grey.
-                        rc = d.get("reasoning_content") or d.get("reasoning") or ""
-                        ct = d.get("content") or ""
-                        if rc:
-                            full += rc
-                            shown = flt.external_reasoning(rc)
-                            if shown:
-                                visible += shown
-                                sys.stdout.write(shown.replace("\n", "\r\n"))
-                                sys.stdout.flush()
-                        if ct:
-                            full += ct
-                            shown = flt.feed_content(ct)
-                            if shown:
-                                visible += shown
-                                sys.stdout.write(shown.replace("\n", "\r\n"))
-                                sys.stdout.flush()
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        pass
-            if not stopped:
-                tail = flt.flush()
-                if tail:
-                    visible += tail
-                    sys.stdout.write(tail.replace("\n", "\r\n"))
-                    sys.stdout.flush()
-        except urllib.error.URLError as e:
-            sys.stdout.write("\r\n\033[31m[error] %s\033[0m\r\n" % e)
-            sys.stdout.flush()
-            messages.pop()
-            continue
-        except KeyboardInterrupt:
-            sys.stdout.write("\r\n\033[2m[interrupted]\033[0m\r\n")
-            sys.stdout.flush()
-            messages.pop()
-            continue
-        sys.stdout.write("\r\n")
-        sys.stdout.flush()
-        # Esc keeps the partial reply in history so the model has context of
-        # what it already generated; only display is filtered.
-        plain = ANSI.sub("", visible)
-        if stopped:
-            sys.stdout.write("\033[2m[stopped]\033[0m\r\n")
-            sys.stdout.flush()
-            log("assistant> " + plain + " [stopped]")
-        else:
-            log("assistant> " + plain)
-        messages.append({"role":"assistant","content":full})
-finally:
-    termios.tcsetattr(FD, termios.TCSANOW, old_term)
-
-PY
-)" "$url" "$model" "$sysp" "$thinking" "$chat_log" "$YMLX_QUICK_TEMP" "$YMLX_QUICK_MAX_TOKENS" "$resume" "$ministral_other" "$is_reasoning"
+      local -a repl_args=(
+        --url "$url"
+        --model "$model"
+        --system-prompt "$sysp"
+        --thinking "$thinking"
+        --control "$control"
+        --markers "$markers"
+        --chat-log "$chat_log"
+        --temperature "$YMLX_QUICK_TEMP"
+        --max-tokens "$YMLX_QUICK_MAX_TOKENS"
+        --resume "$resume"
+        --sibling "$ministral_other"
+      )
+      [[ "$is_reasoning" == "1" ]] && repl_args+=( --reasoning-first )
+      python3 "$_YMLX_SRC_DIR/lib/ymlx_repl.py" "${repl_args[@]}"
       rc=$?
       if (( rc != 3 )); then
         return $rc
@@ -661,25 +278,17 @@ PY
         return 3   # safety: shouldn't happen
       fi
       print -r -- "$ministral_other" > "$state_dir/ministral-default"
-      _ymlx_ministral_swap_to "$ministral_other" || return 1
+      _ymlx_ministral_swap_to "$ministral_other" "$model" "$port" || return 1
       model="$ministral_other"
-      port=11500
+      port="$_YMLX_LAST_LAUNCH_PORT"
       resume=""
     done
   }
 
   _ymlx_apply_quick() {
-    # Thinking is a bare flag in mlx_vlm: --enable-thinking turns it on by
-    # default for requests that don't send top-level enable_thinking. "on"
-    # forces the flag on; "off" removes it (requests can still force it off
-    # per request, as the chat REPL does); "default" leaves hand-written flags
-    # in the config untouched.
-    case "$YMLX_QUICK_THINKING" in
-      on)  _ymlx_flag_set YMLX_CHAT_FLAGS --enable-thinking 1
-           _ymlx_flag_set YMLX_SERVER_FLAGS --enable-thinking 1 ;;
-      off) _ymlx_flag_set YMLX_CHAT_FLAGS --enable-thinking 0
-           _ymlx_flag_set YMLX_SERVER_FLAGS --enable-thinking 0 ;;
-    esac
+    # Thinking is per-model-family and applied at launch / per request (see
+    # _ymlx_apply_launch_thinking and lib/ymlx_repl.py), so it is NOT written
+    # into YMLX_SERVER_FLAGS here — that would be a second source of truth.
     if [[ -n "$YMLX_QUICK_TEMP" ]]; then
       _ymlx_replace_or_append YMLX_CHAT_FLAGS --temperature "$YMLX_QUICK_TEMP"
       # mlx_vlm.server has no server-level temperature flag — temperature is a
@@ -713,7 +322,9 @@ PY
           ''
       fi
       local in_block=0 line
-      while IFS= read -r line; do
+      # `|| [[ -n "$line" ]]` keeps a final line that lacks a trailing newline
+      # (a plain `while read` would drop it and truncate the file).
+      while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" == '# >>> ymlx-managed'* ]]; then
           in_block=1
           printf '%s\n' \
@@ -763,7 +374,7 @@ PY
       [[ -z "$choice" || "$choice" == "Back to Top" ]] && return
       case "$choice" in
         "Thinking:"*)
-          local pick=$(printf "default\non\noff" | gum choose --header "Enable thinking?")
+          local pick=$(printf "default\noff\non" | gum choose --header "Thinking? (default and off both mean off; on shows the reasoning trace)")
           [[ -n "$pick" ]] && YMLX_QUICK_THINKING="$pick"
           ;;
         "Temperature:"*)
@@ -815,35 +426,41 @@ PY
     open "$chat_dir"
   }
 
-  # Swap the running model to a Ministral counterpart: stop whatever is up
-  # (only one model runs at a time on :11500), wait for the port to free, then
-  # launch the requested one. Returns 0 if the new server came up.
+  # Swap a running Ministral half for its sibling: stop only that half (leaving
+  # any other parallel model alone), wait for its port, then relaunch there.
+  # Returns 0 if the new server came up.
   _ymlx_ministral_swap_to() {
-    local new="$1"
-    _ymlx_stop_all >/dev/null 2>&1
+    local new="$1" old_model="$2" old_port="$3"
+    local pid port model
+    while IFS=$'\t' read -r pid port model; do
+      [[ -n "$pid" && "$model" == "$old_model" ]] && { kill "$pid" 2>/dev/null; _ymlx_drop "$pid"; }
+    done < <(_ymlx_running)
     local i
     for i in {1..40}; do
-      _ymlx_port_free 11500 && break
+      _ymlx_port_free "$old_port" && break
       sleep 0.2
     done
-    _ymlx_launch "$new"
+    _ymlx_launch "$new" "$old_port"
   }
 
   _ymlx_main_restart() {
     _ymlx_main_clear
-    local pid port model running_model=""
+    local -a running_models=()
+    local pid port model
     while IFS=$'\t' read -r pid port model; do
-      [[ -n "$pid" ]] && running_model="$model"
+      [[ -n "$model" ]] && running_models+=( "$model" )
     done < <(_ymlx_running)
-    if [[ -n "$running_model" ]]; then
+    if (( ${#running_models} )); then
       _ymlx_stop_all >/dev/null 2>&1
-      echo "Restarting: $running_model"
       local i
       for i in {1..40}; do
         _ymlx_port_free 11500 && break
         sleep 0.2
       done
-      _ymlx_launch "$running_model"
+      for model in "${running_models[@]}"; do
+        echo "Restarting: $model"
+        _ymlx_launch "$model"
+      done
     else
       echo "No model is running — nothing to restart."
       echo "(Menu refreshed.)"
@@ -905,19 +522,21 @@ if [[ -z "$HF_TOKEN" && -s "$(_ymlx_hf_token_file)" ]]; then
   export HF_TOKEN="$(<"$(_ymlx_hf_token_file)")"
 fi
 
-# Discover the currently running mlx_vlm.server on :11500 by asking the OS, not
-# a state file. Emits a TSV line: pid<TAB>port<TAB>model.
-# The model id is parsed from the process's --model arg.
-_ymlx_running() {
-    local lpid cmd m
-    lpid=$(lsof -iTCP:11500 -sTCP:LISTEN -t 2>/dev/null | head -n1)
-    [[ -z "$lpid" ]] && return
-    cmd=$(ps -o command= -p "$lpid" 2>/dev/null)
-    [[ "$cmd" != *"--model "* ]] && return
-    m="${cmd#*--model }"
-    m="${m%% *}"
-    [[ -z "$m" ]] && return
-    printf '%s\t%s\t%s\n' "$lpid" 11500 "$m"
+  # Discover running mlx_vlm.server instances on ymlx's ports (11500-11509) by
+  # asking the OS, not a state file. Emits one TSV line per server:
+  # pid<TAB>port<TAB>model. The model id is parsed from the process's --model arg.
+  _ymlx_running() {
+    local p lpid cmd m
+    for p in {11500..11509}; do
+      lpid=$(lsof -iTCP:"$p" -sTCP:LISTEN -t 2>/dev/null | head -n1)
+      [[ -z "$lpid" ]] && continue
+      cmd=$(ps -o command= -p "$lpid" 2>/dev/null)
+      [[ "$cmd" != *"--model "* ]] && continue
+      m="${cmd#*--model }"
+      m="${m%% *}"
+      [[ -z "$m" ]] && continue
+      printf '%s\t%s\t%s\n' "$lpid" "$p" "$m"
+    done
   }
 
   # Remove a pid from the session-tracked list (called after we kill it, so
@@ -941,15 +560,23 @@ _ymlx_running() {
   }
 
   _ymlx_launch() {
-    local model="$1"
-    local port=$(_ymlx_find_port)
+    local model="$1" forced_port="${2:-}"
+    local port
+    if [[ -n "$forced_port" ]]; then
+      port="$forced_port"
+    else
+      port=$(_ymlx_find_port)
+    fi
     if [[ -z "$port" ]]; then
-      echo "Port :11500 is busy. Stop the running model (^s in the menu) first."
+      echo "All ports :11500–:11509 are busy. Stop a running model (^s in the menu) first."
       return 1
     fi
+    _YMLX_LAST_LAUNCH_PORT="$port"
     local safe="${model//\//_}"
     local log="$log_dir/${safe}-${port}.log"
-    mlx_vlm.server --model "$model" --port "$port" "${YMLX_SERVER_FLAGS[@]}" >"$log" 2>&1 &
+    local -a launch_flags=( "${YMLX_SERVER_FLAGS[@]}" )
+    _ymlx_apply_launch_thinking launch_flags "$model" "$hub_dir"
+    mlx_vlm.server --model "$model" --port "$port" "${launch_flags[@]}" >"$log" 2>&1 &
     local pid=$!
     _YMLX_SESSION_PIDS+=( "$pid" )
     local rc=0
@@ -1506,7 +1133,7 @@ PY
           _H_render
           return
         fi
-        port=11500
+        port="$_YMLX_LAST_LAUNCH_PORT"
       fi
       _ymlx_chat_repl "$model" "$port" "$file"
       _H_render
@@ -1777,7 +1404,7 @@ PY
     if (( _YMLX_MENU_NO_MODELS )); then
       out+=( $'\e[1;35mNo models installed yet.\e[0m' )
     else
-      out+=( $'\e[1;35mSelect model:\e[0m' )
+      out+=( $'\e[1;35mSelect model and run:\e[0m' )
     fi
     n=${#_YMLX_MENU_LINES[@]}
     end=$(( _YMLX_MENU_SCROLL + _YMLX_MENU_VIS ))
@@ -1911,20 +1538,21 @@ PY
       local ins="${pair%%$'\t'*}" rea="${pair##*$'\t'}"
       local cur="${_YMLX_MENU_MODELS[$idx]}"
       local other="$ins"; [[ "$cur" == "$ins" ]] && other="$rea"
+      local pair_port="${_YMLX_MENU_PORTS[$idx]}"
       local up="" pid port model
       while IFS=$'\t' read -r pid port model; do
-        [[ -n "$pid" && ( "$model" == "$ins" || "$model" == "$rea" ) ]] && { up=1; kill "$pid" 2>/dev/null; _ymlx_drop "$pid"; }
+        [[ -n "$pid" && ( "$model" == "$ins" || "$model" == "$rea" ) ]] && { up=1; pair_port="$port"; kill "$pid" 2>/dev/null; _ymlx_drop "$pid"; }
       done < <(_ymlx_running)
       print -r -- "$other" > "$state_dir/ministral-default"
       _ymlx_main_clear
       if [[ -n "$up" ]]; then
         local i
         for i in {1..40}; do
-          _ymlx_port_free 11500 && break
+          _ymlx_port_free "$pair_port" && break
           sleep 0.2
         done
         echo "Switching to $(_ymlx_ministral_base "$other")…"
-        _ymlx_launch "$other"
+        _ymlx_launch "$other" "$pair_port"
       else
         echo "Ministral: next start uses $(_ymlx_ministral_base "$other")."
       fi
@@ -2088,23 +1716,35 @@ PY
     _ymlx_main_clear
     if [[ "$kind" == "model" ]]; then
       if [[ -n "$port" ]]; then
+        # Already running — just chat with it.
         _ymlx_chat_repl "$model" "$port"
+      elif [[ -n "$(_ymlx_running)" ]]; then
+        # A different model is running: swap, run alongside, or cancel.
+        local choice
+        choice=$(printf 'Yes\nNo\nRun in parallel' | gum choose --header "Do you want to swap models? (a model is already running)" --height 6)
+        case "$choice" in
+          "Yes")
+            # Swap: stop everything, then run the selected model on :11500.
+            _ymlx_stop_all >/dev/null 2>&1
+            local i
+            for i in {1..40}; do
+              _ymlx_port_free 11500 && break
+              sleep 0.2
+            done
+            if _ymlx_launch "$model"; then
+              _ymlx_chat_repl "$model" "$_YMLX_LAST_LAUNCH_PORT"
+            fi
+            ;;
+          "Run in parallel")
+            if _ymlx_launch "$model"; then
+              _ymlx_chat_repl "$model" "$_YMLX_LAST_LAUNCH_PORT"
+            fi
+            ;;
+          *) : ;;   # No / esc — back to the menu
+        esac
       else
-        local _occ_pid="" _occ_model="" _p _pt _m
-        while IFS=$'\t' read -r _p _pt _m; do
-          if [[ "$_pt" == "11500" ]]; then
-            _occ_pid="$_p"; _occ_model="$_m"
-            break
-          fi
-        done < <(_ymlx_running)
-        if [[ -n "$_occ_pid" ]]; then
-          echo "Port :11500 is busy running $_occ_model."
-          echo "Stop it with ^s, then try again."
-          _ymlx_pause
-        else
-          if _ymlx_launch "$model"; then
-            _ymlx_chat_repl "$model" "11500"
-          fi
+        if _ymlx_launch "$model"; then
+          _ymlx_chat_repl "$model" "$_YMLX_LAST_LAUNCH_PORT"
         fi
       fi
     else
@@ -2239,22 +1879,28 @@ PY
   }
 
   # Headless (non-interactive) helpers -------------------------------
-  _ymlx_running_model() {  # echoes pid\tport\tmodel (or nothing)
-    local line
-    line="$(_ymlx_running)" && [[ -n "$line" ]] && print "$line"
+  # pi always talks to :11500, so headless mode is primary-port only and never
+  # uses the parallel-run fallback that _ymlx_find_port offers the menu.
+  _ymlx_running_model() {  # echoes pid\tport\tmodel for :11500 (or nothing)
+    local pid port model
+    while IFS=$'\t' read -r pid port model; do
+      [[ "$port" == "11500" ]] && { printf '%s\t%s\t%s\n' "$pid" "$port" "$model"; return 0; }
+    done < <(_ymlx_running)
+    return 1
   }
 
   _ymlx_headless_launch() {
     local model="$1"
-    local port
-    port=$(_ymlx_find_port)
-    if [[ -z "$port" ]]; then
+    local port=11500
+    if ! _ymlx_port_free "$port"; then
       print -u2 "ymlx: port 11500 is busy — stop the running model first (ymlx stop)"
       return 1
     fi
     local safe="${model//\//_}"
     local log="$log_dir/${safe}-${port}.log"
-    mlx_vlm.server --model "$model" --port "$port" "${YMLX_SERVER_FLAGS[@]}" >"$log" 2>&1 &!
+    local -a launch_flags=( "${YMLX_SERVER_FLAGS[@]}" )
+    _ymlx_apply_launch_thinking launch_flags "$model" "$hub_dir"
+    mlx_vlm.server --model "$model" --port "$port" "${launch_flags[@]}" >"$log" 2>&1 &!
     local pid=$!
     print "ymlx: starting $model on :$port (pid $pid) — log: $log"
     local i
